@@ -77,10 +77,22 @@ Examples:
         help="Deviation threshold. Default: auto-calibrate to 1 std dev",
     )
     parser.add_argument(
+        "--theta-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply auto-calibrated theta by this (default: 1.0, try 1.5-2.0)",
+    )
+    parser.add_argument(
         "--stop-multiple",
         type=float,
         default=2.0,
         help="Stop loss as multiple of sigma (default: 2.0)",
+    )
+    parser.add_argument(
+        "--target-fraction",
+        type=float,
+        default=0.5,
+        help="Take profit when |d_i| < theta * this fraction (default: 0.5)",
     )
     parser.add_argument(
         "--max-position-pct",
@@ -93,6 +105,18 @@ Examples:
         type=int,
         default=15,
         help="Minutes before session close to flatten (default: 15)",
+    )
+    parser.add_argument(
+        "--min-hold-bars",
+        type=int,
+        default=0,
+        help="Minimum bars to hold before allowing exit (default: 0)",
+    )
+    parser.add_argument(
+        "--skip-first-minutes",
+        type=int,
+        default=0,
+        help="Skip first N minutes of RTH session (default: 0)",
     )
 
     # Engine parameters
@@ -206,9 +230,13 @@ def main() -> None:
     strategy = ContraMeanReversionStrategy(
         signal_window_minutes=args.window,
         theta=args.theta,
+        theta_multiplier=args.theta_multiplier,
         stop_multiple=args.stop_multiple,
+        target_fraction=args.target_fraction,
         max_position_pct=args.max_position_pct,
         session_cutoff_minutes=args.cutoff_minutes,
+        min_hold_bars=args.min_hold_bars,
+        skip_first_minutes=args.skip_first_minutes,
     )
 
     # Build engine config

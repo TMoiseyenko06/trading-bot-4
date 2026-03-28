@@ -114,27 +114,37 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         name: str = "Contra_MeanRev",
         signal_window_minutes: int = 30,
         theta: Optional[float] = None,
+        theta_multiplier: float = 1.0,
         stop_multiple: float = 2.0,
+        target_fraction: float = 0.5,
         max_position_pct: float = 0.10,
         session_cutoff_minutes: int = 15,
+        min_hold_bars: int = 0,
+        skip_first_minutes: int = 0,
     ) -> None:
         super().__init__(name)
         self._window_minutes = signal_window_minutes
         self._theta = theta
         self._theta_auto = theta is None
+        self._theta_multiplier = theta_multiplier
         self._stop_multiple = stop_multiple
+        self._target_fraction = target_fraction
         self._max_pos_pct = max_position_pct
         self._cutoff_minutes = session_cutoff_minutes
+        self._min_hold_bars = min_hold_bars
+        self._skip_first_minutes = skip_first_minutes
 
         # Runtime state
         self._symbols: list[str] = []
         self._data: dict[str, _InstrumentData] = {}
         self._in_trade: bool = False
+        self._trade_entry_bar: int = 0
         self._bars_in_window: int = 0
         self._bars_per_window: int = 0
         self._session_active: bool = False
         self._past_cutoff: bool = False
         self._session_pnl: float = 0.0
+        self._session_bars: int = 0
 
         # Theta calibration
         self._calibration_deviations: list[float] = []
@@ -150,12 +160,17 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
 
         logger.info(
             "ContraMeanRev initialized: instruments=%s, window=%dm, "
-            "theta=%s, stop=%.1fx, cutoff=%dm",
+            "theta=%s (x%.1f), stop=%.1fx, target_frac=%.2f, cutoff=%dm, "
+            "min_hold=%d bars, skip_first=%dm",
             self._symbols,
             self._window_minutes,
             self._theta if self._theta else "auto-calibrate",
+            self._theta_multiplier,
             self._stop_multiple,
+            self._target_fraction,
             self._cutoff_minutes,
+            self._min_hold_bars,
+            self._skip_first_minutes,
         )
 
     def on_bar(
@@ -174,11 +189,18 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         if not session.is_rth:
             return
 
+        self._session_bars += 1
+
         # Infer bars per window from bar duration
         if self._bars_per_window == 0:
             any_bar = state.instruments[self._symbols[0]].bar
             bar_minutes = max(1, any_bar.duration_ns // 60_000_000_000)
             self._bars_per_window = max(1, self._window_minutes // bar_minutes)
+            self._skip_first_bars = max(1, self._skip_first_minutes // bar_minutes) if self._skip_first_minutes > 0 else 0
+
+        # Skip first N minutes of session (let opening noise settle)
+        if self._skip_first_minutes > 0 and self._session_bars <= self._skip_first_bars:
+            return
 
         # Update per-instrument ATR and volume
         for sym in self._symbols:
@@ -419,6 +441,7 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
                 )
 
         self._in_trade = True
+        self._trade_entry_bar = state.bar_index
 
     # ------------------------------------------------------------------ #
     # Exit checks
@@ -431,11 +454,16 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         if not self._in_trade:
             return
 
-        # TARGET EXIT: all |d_i| < theta/2 for held positions
+        # Minimum hold period — don't exit too early
+        bars_held = state.bar_index - self._trade_entry_bar
+        if self._min_hold_bars > 0 and bars_held < self._min_hold_bars:
+            return
+
+        # TARGET EXIT: all |d_i| < theta * target_fraction for held positions
         if self._theta is not None:
-            half_theta = self._theta / 2.0
+            target_theta = self._theta * self._target_fraction
             all_reverted = all(
-                abs(self._data[s].deviation) < half_theta
+                abs(self._data[s].deviation) < target_theta
                 for s in self._symbols
                 if state.instruments[s].position_quantity > 0
             )
@@ -527,6 +555,7 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         self._past_cutoff = False
         self._in_trade = False
         self._session_pnl = 0.0
+        self._session_bars = 0
 
         # After first session of calibration, compute theta
         if self._theta_auto and not self._calibrated and self._calibration_deviations:
@@ -564,15 +593,16 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         ) / max(1, n - 1)
         std = math.sqrt(variance)
 
-        self._theta = std
+        self._theta = std * self._theta_multiplier
         self._calibrated = True
         logger.info(
-            "[%s] Theta calibrated: %.6f (from %d samples, mean=%.6f, std=%.6f)",
+            "[%s] Theta calibrated: %.6f (base_std=%.6f x %.1f, from %d samples, mean=%.6f)",
             self.name,
             self._theta,
+            std,
+            self._theta_multiplier,
             n,
             mean,
-            std,
         )
 
     # ------------------------------------------------------------------ #
