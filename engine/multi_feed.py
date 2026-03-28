@@ -91,59 +91,117 @@ class MultiInstrumentFeed:
             )
 
     def _iter_single_file(self) -> Iterator[MultiBar]:
-        """Iterate a single .dbn file, grouping bars by timestamp and root symbol."""
+        """Iterate a single .dbn file, grouping bars by timestamp and root symbol.
+
+        When multiple contracts exist for the same root at the same timestamp
+        (front + back month during roll periods), uses cumulative session
+        volume to pick the front month. This prevents flip-flopping between
+        contracts on individual bars where volume leadership is noisy.
+        """
         assert self._single_path is not None
         data_feed = DataFeed(self._single_path)
 
         allowed_roots: set[str] | None = None
+        known_roots = set(self._registry.list_symbols())
         if self._instruments:
             allowed_roots = set(self._instruments)
 
         bar_index = 0
         current_ts: datetime | None = None
-        bars_at_ts: dict[str, Bar] = {}
+        # At each timestamp, collect ALL bars per root (may have multiple contracts)
+        candidates_at_ts: dict[str, list[Bar]] = {}
+
+        # Track cumulative volume per contract symbol to determine front month
+        cum_volume: dict[str, int] = {}
+        # Track current front month per root for stability
+        current_front: dict[str, str] = {}
 
         for bar in data_feed:
-            # Extract root symbol from the bar's symbol field
-            root = self._registry.extract_root(
-                bar.symbol, known_roots=set(self._registry.list_symbols())
-            )
+            root = self._registry.extract_root(bar.symbol, known_roots=known_roots)
 
-            # Filter to requested instruments
             if allowed_roots and root not in allowed_roots:
                 continue
 
             if current_ts is None:
                 current_ts = bar.timestamp
 
-            # If we've moved to a new timestamp, yield the previous group
+            # New timestamp: resolve previous group and yield
             if bar.timestamp != current_ts:
-                if bars_at_ts:
+                resolved = self._resolve_front_months(
+                    candidates_at_ts, cum_volume, current_front
+                )
+                if resolved:
                     yield MultiBar(
                         timestamp=current_ts,
-                        bars=bars_at_ts,
+                        bars=resolved,
                         bar_index=bar_index,
                     )
                     bar_index += 1
                 current_ts = bar.timestamp
-                bars_at_ts = {}
+                candidates_at_ts = {}
 
-            # If multiple contracts exist for the same root at the same
-            # timestamp (front + back month during rolls), keep the one
-            # with the highest volume (front month).
-            if root in bars_at_ts:
-                if bar.volume > bars_at_ts[root].volume:
-                    bars_at_ts[root] = bar
-            else:
-                bars_at_ts[root] = bar
+            # Accumulate candidates
+            if root not in candidates_at_ts:
+                candidates_at_ts[root] = []
+            candidates_at_ts[root].append(bar)
 
-        # Yield the final group
-        if bars_at_ts and current_ts is not None:
-            yield MultiBar(
-                timestamp=current_ts,
-                bars=bars_at_ts,
-                bar_index=bar_index,
+            # Track cumulative volume per contract
+            cum_volume[bar.symbol] = cum_volume.get(bar.symbol, 0) + bar.volume
+
+        # Yield final group
+        if candidates_at_ts and current_ts is not None:
+            resolved = self._resolve_front_months(
+                candidates_at_ts, cum_volume, current_front
             )
+            if resolved:
+                yield MultiBar(
+                    timestamp=current_ts,
+                    bars=resolved,
+                    bar_index=bar_index,
+                )
+
+    @staticmethod
+    def _resolve_front_months(
+        candidates: dict[str, list[Bar]],
+        cum_volume: dict[str, int],
+        current_front: dict[str, str],
+    ) -> dict[str, Bar]:
+        """Pick the front-month contract for each root symbol.
+
+        Uses cumulative volume to determine the front month. Once a contract
+        takes the cumulative volume lead, it stays as front month until
+        another contract surpasses it. This prevents noisy flip-flopping
+        during roll periods.
+        """
+        result: dict[str, Bar] = {}
+        for root, bars in candidates.items():
+            if len(bars) == 1:
+                chosen = bars[0]
+            else:
+                # Sort by cumulative volume (descending)
+                bars.sort(
+                    key=lambda b: cum_volume.get(b.symbol, 0), reverse=True
+                )
+                chosen = bars[0]
+
+                # If we already have a front month for this root, prefer
+                # sticking with it unless a different contract has pulled
+                # clearly ahead in cumulative volume
+                if root in current_front:
+                    prev_sym = current_front[root]
+                    prev_vol = cum_volume.get(prev_sym, 0)
+                    new_vol = cum_volume.get(chosen.symbol, 0)
+                    if chosen.symbol != prev_sym and new_vol < prev_vol * 1.1:
+                        # Previous front month still has more cumulative volume
+                        # (or within 10%), stick with it
+                        for b in bars:
+                            if b.symbol == prev_sym:
+                                chosen = b
+                                break
+
+            current_front[root] = chosen.symbol
+            result[root] = chosen
+        return result
 
     def _iter_multiple_files(self) -> Iterator[MultiBar]:
         """Merge multiple .dbn files by timestamp using a min-heap."""

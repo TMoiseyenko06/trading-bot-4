@@ -111,7 +111,7 @@ class SessionHandler:
         if bar.symbol and self._prev_symbol is not None:
             if bar.symbol != self._prev_symbol:
                 ctx.contract_roll_pending = True
-                logger.info(
+                logger.debug(
                     "Contract roll detected: %s -> %s at bar %d",
                     self._prev_symbol,
                     bar.symbol,
