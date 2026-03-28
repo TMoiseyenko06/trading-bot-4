@@ -128,7 +128,14 @@ class MultiInstrumentFeed:
                 current_ts = bar.timestamp
                 bars_at_ts = {}
 
-            bars_at_ts[root] = bar
+            # If multiple contracts exist for the same root at the same
+            # timestamp (front + back month during rolls), keep the one
+            # with the highest volume (front month).
+            if root in bars_at_ts:
+                if bar.volume > bars_at_ts[root].volume:
+                    bars_at_ts[root] = bar
+            else:
+                bars_at_ts[root] = bar
 
         # Yield the final group
         if bars_at_ts and current_ts is not None:
