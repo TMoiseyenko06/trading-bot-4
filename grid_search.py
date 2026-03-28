@@ -130,13 +130,13 @@ def run_single(
         calmar=result.calmar_ratio,
         max_dd_pct=result.max_drawdown_pct,
         max_dd_dollars=result.max_drawdown_dollars,
-        total_trades=result.total_trades,
+        total_trades=result.num_trades,
         avg_winner=result.avg_winner,
         avg_loser=result.avg_loser,
         expectancy=result.expectancy,
-        best_day=result.best_day,
-        worst_day=result.worst_day,
-        avg_hold_bars=result.avg_hold_bars,
+        best_day=result.best_daily_pnl,
+        worst_day=result.worst_daily_pnl,
+        avg_hold_bars=result.avg_hold_time_bars,
     )
 
 
