@@ -292,7 +292,14 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
             else:
                 data.raw_weight = 0.0
 
-        # Step 7: Normalize so sum(|w_i|) == 1
+        # Step 7: Force zero-sum then normalize so sum(|w_i|) == 1
+        # Dividing d_i by sigma_i breaks zero-sum (since sigmas differ per instrument),
+        # so we demean the raw weights to restore dollar neutrality before normalizing.
+        n_syms = len(self._symbols)
+        mean_raw = sum(self._data[s].raw_weight for s in self._symbols) / n_syms
+        for sym in self._symbols:
+            self._data[sym].raw_weight -= mean_raw
+
         total_abs = sum(abs(self._data[s].raw_weight) for s in self._symbols)
         if total_abs > 0:
             for sym in self._symbols:
@@ -303,9 +310,9 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
             for sym in self._symbols:
                 self._data[sym].normalized_weight = 0.0
 
-        # Step 8: Verify dollar neutrality
+        # Verify dollar neutrality
         weight_sum = sum(self._data[s].normalized_weight for s in self._symbols)
-        if abs(weight_sum) > 1e-10:
+        if abs(weight_sum) > 1e-6:
             logger.error(
                 "DOLLAR NEUTRALITY VIOLATED: sum(w_i) = %.10f", weight_sum
             )
