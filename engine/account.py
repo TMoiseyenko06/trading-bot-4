@@ -201,6 +201,7 @@ class AccountTracker:
         # Update margin
         self._update_margin(is_intraday=True)
 
+        self.trades.extend(completed_trades)
         return completed_trades
 
     def _open_position(self, fill: Fill, bar_index: int) -> None:
