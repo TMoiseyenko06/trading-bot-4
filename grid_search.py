@@ -34,10 +34,12 @@ from strategies.contrarian_reversion import ContraMeanReversionStrategy
 class ParamSet:
     """One combination of strategy parameters."""
 
-    window: int
-    theta_multiplier: float
+    lookback_bars: int
+    z_entry: float
+    z_exit: float
+    confirm_bars: int
     stop_multiple: float
-    target_fraction: float
+    momentum_threshold: float
     min_hold_bars: int
     skip_first_minutes: int
 
@@ -75,13 +77,12 @@ def run_single(
 ) -> SearchResult:
     """Run one backtest with a specific parameter set."""
     strategy = ContraMeanReversionStrategy(
-        signal_window_minutes=params.window,
-        theta=None,  # Always auto-calibrate
-        theta_multiplier=params.theta_multiplier,
+        lookback_bars=params.lookback_bars,
+        z_entry_threshold=params.z_entry,
+        z_exit_threshold=params.z_exit,
+        confirm_bars=params.confirm_bars,
         stop_multiple=params.stop_multiple,
-        target_fraction=params.target_fraction,
-        max_position_pct=0.10,
-        session_cutoff_minutes=15,
+        momentum_threshold=params.momentum_threshold,
         min_hold_bars=params.min_hold_bars,
         skip_first_minutes=params.skip_first_minutes,
     )
@@ -149,15 +150,16 @@ def print_results_table(results: list[SearchResult]) -> None:
     )
 
     header = (
-        f"{'#':>3}  {'Win':>5}  {'ThtM':>4}  {'Stop':>4}  {'TgtF':>4}  "
-        f"{'Hold':>4}  {'Skip':>4}  {'PF':>6}  {'WR%':>5}  {'Sharpe':>6}  "
+        f"{'#':>3}  {'LB':>4}  {'Zin':>4}  {'Zout':>4}  {'Conf':>4}  "
+        f"{'Stop':>4}  {'Mom':>4}  {'Hold':>4}  {'Skip':>4}  "
+        f"{'PF':>6}  {'WR%':>5}  {'Sharpe':>6}  "
         f"{'Sortino':>7}  {'NetPnL':>12}  {'MaxDD%':>6}  {'Trades':>6}  "
         f"{'AvgW':>8}  {'AvgL':>8}  {'Expect':>8}"
     )
     sep = "-" * len(header)
 
     print("\n" + sep)
-    print("  GRID SEARCH RESULTS (sorted by Profit Factor)")
+    print("  GRID SEARCH RESULTS v2 (sorted by Profit Factor)")
     print(sep)
     print(header)
     print(sep)
@@ -166,8 +168,9 @@ def print_results_table(results: list[SearchResult]) -> None:
         p = r.params
         pf_str = f"{r.profit_factor:.2f}" if r.profit_factor < 100 else "inf"
         print(
-            f"{i:>3}  {p.window:>5}  {p.theta_multiplier:>4.1f}  "
-            f"{p.stop_multiple:>4.1f}  {p.target_fraction:>4.2f}  "
+            f"{i:>3}  {p.lookback_bars:>4}  {p.z_entry:>4.1f}  "
+            f"{p.z_exit:>4.1f}  {p.confirm_bars:>4}  "
+            f"{p.stop_multiple:>4.1f}  {p.momentum_threshold:>4.1f}  "
             f"{p.min_hold_bars:>4}  {p.skip_first_minutes:>4}  "
             f"{pf_str:>6}  {r.win_rate:>5.1f}  {r.sharpe:>6.2f}  "
             f"{r.sortino:>7.2f}  {r.net_pnl:>12,.0f}  {r.max_dd_pct:>5.1f}%  "
@@ -186,7 +189,8 @@ def save_results_csv(results: list[SearchResult], path: str) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "window", "theta_multiplier", "stop_multiple", "target_fraction",
+            "lookback_bars", "z_entry", "z_exit", "confirm_bars",
+            "stop_multiple", "momentum_threshold",
             "min_hold_bars", "skip_first_minutes",
             "profit_factor", "win_rate", "sharpe", "sortino", "calmar",
             "net_pnl", "max_dd_pct", "max_dd_dollars", "total_trades",
@@ -196,7 +200,8 @@ def save_results_csv(results: list[SearchResult], path: str) -> None:
         for r in results:
             p = r.params
             writer.writerow([
-                p.window, p.theta_multiplier, p.stop_multiple, p.target_fraction,
+                p.lookback_bars, p.z_entry, p.z_exit, p.confirm_bars,
+                p.stop_multiple, p.momentum_threshold,
                 p.min_hold_bars, p.skip_first_minutes,
                 r.profit_factor, r.win_rate, r.sharpe, r.sortino, r.calmar,
                 r.net_pnl, r.max_dd_pct, r.max_dd_dollars, r.total_trades,
@@ -267,24 +272,32 @@ Examples:
 
     # Parameter ranges (comma-separated)
     parser.add_argument(
-        "--windows", type=str, default="30,60,90,120",
-        help="Signal window lengths in minutes (default: 30,60,90,120)",
+        "--lookbacks", type=str, default="30,60,90",
+        help="Rolling lookback bars for z-score (default: 30,60,90)",
     )
     parser.add_argument(
-        "--theta-multipliers", type=str, default="1.0,1.5,2.0",
-        help="Theta multipliers (default: 1.0,1.5,2.0)",
+        "--z-entries", type=str, default="1.5,2.0,2.5",
+        help="Z-score entry thresholds (default: 1.5,2.0,2.5)",
+    )
+    parser.add_argument(
+        "--z-exits", type=str, default="0.3,0.5",
+        help="Z-score exit thresholds (default: 0.3,0.5)",
+    )
+    parser.add_argument(
+        "--confirm", type=str, default="2,3",
+        help="Confirmation bars (default: 2,3)",
     )
     parser.add_argument(
         "--stop-multiples", type=str, default="2.0,3.0,4.0",
         help="Stop loss multiples (default: 2.0,3.0,4.0)",
     )
     parser.add_argument(
-        "--target-fractions", type=str, default="0.3,0.5",
-        help="Target profit fractions (default: 0.3,0.5)",
+        "--momentum-thresholds", type=str, default="0.65,0.75",
+        help="Momentum regime thresholds (default: 0.65,0.75)",
     )
     parser.add_argument(
-        "--min-hold", type=str, default="0,5",
-        help="Minimum hold bars (default: 0,5)",
+        "--min-hold", type=str, default="3,5",
+        help="Minimum hold bars (default: 3,5)",
     )
     parser.add_argument(
         "--skip-first", type=str, default="0,30",
@@ -317,10 +330,12 @@ Examples:
     )
 
     # Parse parameter ranges
-    windows = parse_int_list(args.windows)
-    theta_mults = parse_float_list(args.theta_multipliers)
+    lookbacks = parse_int_list(args.lookbacks)
+    z_entries = parse_float_list(args.z_entries)
+    z_exits = parse_float_list(args.z_exits)
+    confirms = parse_int_list(args.confirm)
     stop_mults = parse_float_list(args.stop_multiples)
-    target_fracs = parse_float_list(args.target_fractions)
+    mom_thresholds = parse_float_list(args.momentum_thresholds)
     min_holds = parse_int_list(args.min_hold)
     skip_firsts = parse_int_list(args.skip_first)
 
@@ -328,21 +343,24 @@ Examples:
 
     # Build all combinations
     combos = list(itertools.product(
-        windows, theta_mults, stop_mults, target_fracs, min_holds, skip_firsts
+        lookbacks, z_entries, z_exits, confirms,
+        stop_mults, mom_thresholds, min_holds, skip_firsts,
     ))
     total = len(combos)
 
     print("=" * 60)
-    print("  GRID SEARCH — Contrarian Mean-Reversion")
+    print("  GRID SEARCH v2 — Contrarian Mean-Reversion")
     print("=" * 60)
     print(f"  Data: {args.dbn_file}")
     print(f"  Instruments: {instruments}")
     print(f"  Capital: ${args.capital:,.0f}")
     print()
-    print(f"  Windows:           {windows}")
-    print(f"  Theta multipliers: {theta_mults}")
+    print(f"  Lookback bars:     {lookbacks}")
+    print(f"  Z-entry thresholds:{z_entries}")
+    print(f"  Z-exit thresholds: {z_exits}")
+    print(f"  Confirm bars:      {confirms}")
     print(f"  Stop multiples:    {stop_mults}")
-    print(f"  Target fractions:  {target_fracs}")
+    print(f"  Momentum thresh:   {mom_thresholds}")
     print(f"  Min hold bars:     {min_holds}")
     print(f"  Skip first mins:   {skip_firsts}")
     print()
@@ -358,12 +376,14 @@ Examples:
 
     # Build worker arguments — use dicts since dataclasses may not pickle across processes
     worker_args = []
-    for win, tm, sm, tf, mh, sf in combos:
+    for lb, ze, zx, cb, sm, mt, mh, sf in combos:
         params_dict = dict(
-            window=win,
-            theta_multiplier=tm,
+            lookback_bars=lb,
+            z_entry=ze,
+            z_exit=zx,
+            confirm_bars=cb,
             stop_multiple=sm,
-            target_fraction=tf,
+            momentum_threshold=mt,
             min_hold_bars=mh,
             skip_first_minutes=sf,
         )
@@ -378,17 +398,19 @@ Examples:
     if sequential:
         # Sequential mode — same as before, with progress
         registry = ContractRegistry()
-        for i, (win, tm, sm, tf, mh, sf) in enumerate(combos, 1):
+        for i, (lb, ze, zx, cb, sm, mt, mh, sf) in enumerate(combos, 1):
             params = ParamSet(
-                window=win, theta_multiplier=tm, stop_multiple=sm,
-                target_fraction=tf, min_hold_bars=mh, skip_first_minutes=sf,
+                lookback_bars=lb, z_entry=ze, z_exit=zx,
+                confirm_bars=cb, stop_multiple=sm,
+                momentum_threshold=mt, min_hold_bars=mh,
+                skip_first_minutes=sf,
             )
             elapsed = time.time() - start_time
             avg_per = elapsed / max(1, i - 1)
             remaining = avg_per * (total - i + 1)
             print(
-                f"[{i}/{total}] win={win}, theta_m={tm:.1f}, stop={sm:.1f}, "
-                f"tgt={tf:.2f}, hold={mh}, skip={sf}  "
+                f"[{i}/{total}] lb={lb}, z_in={ze:.1f}, z_out={zx:.1f}, "
+                f"conf={cb}, stop={sm:.1f}, mom={mt:.2f}, hold={mh}, skip={sf}  "
                 f"(~{remaining/60:.0f}m remaining)",
                 end="", flush=True,
             )
@@ -424,9 +446,9 @@ Examples:
                     p = result.params
                     pf = f"{result.profit_factor:.2f}" if result.profit_factor < 100 else "inf"
                     print(
-                        f"  [{completed}/{total}] win={p.window}, theta_m={p.theta_multiplier:.1f}, "
-                        f"stop={p.stop_multiple:.1f}, tgt={p.target_fraction:.2f}, "
-                        f"hold={p.min_hold_bars}, skip={p.skip_first_minutes}  "
+                        f"  [{completed}/{total}] lb={p.lookback_bars}, z_in={p.z_entry:.1f}, "
+                        f"z_out={p.z_exit:.1f}, conf={p.confirm_bars}, "
+                        f"stop={p.stop_multiple:.1f}, mom={p.momentum_threshold:.2f}  "
                         f"-> PF={pf}, WR={result.win_rate:.1f}%, "
                         f"PnL=${result.net_pnl:,.0f}, DD={result.max_dd_pct:.1f}%  "
                         f"(~{remaining/60:.0f}m remaining)"

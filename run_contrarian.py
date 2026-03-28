@@ -65,58 +65,64 @@ Examples:
 
     # Strategy parameters
     parser.add_argument(
-        "--window",
-        type=int,
-        default=30,
-        help="Signal window length in minutes (default: 30)",
+        "--window", type=int, default=60,
+        help="Signal window length in minutes (default: 60)",
     )
     parser.add_argument(
-        "--theta",
-        type=float,
-        default=None,
-        help="Deviation threshold. Default: auto-calibrate to 1 std dev",
+        "--theta", type=float, default=None,
+        help="Deviation threshold. Default: auto-calibrate",
     )
     parser.add_argument(
-        "--theta-multiplier",
-        type=float,
-        default=1.0,
-        help="Multiply auto-calibrated theta by this (default: 1.0, try 1.5-2.0)",
+        "--theta-multiplier", type=float, default=1.5,
+        help="Multiply auto-calibrated theta (default: 1.5)",
     )
     parser.add_argument(
-        "--stop-multiple",
-        type=float,
-        default=2.0,
-        help="Stop loss as multiple of sigma (default: 2.0)",
+        "--stop-multiple", type=float, default=3.0,
+        help="Stop loss multiple (default: 3.0)",
     )
     parser.add_argument(
-        "--target-fraction",
-        type=float,
-        default=0.5,
-        help="Take profit when |d_i| < theta * this fraction (default: 0.5)",
+        "--target-fraction", type=float, default=0.4,
+        help="Take profit fraction of theta (default: 0.4)",
     )
     parser.add_argument(
-        "--max-position-pct",
-        type=float,
-        default=0.10,
+        "--max-position-pct", type=float, default=0.10,
         help="Max position per instrument as %% of capital (default: 0.10)",
     )
     parser.add_argument(
-        "--cutoff-minutes",
-        type=int,
-        default=15,
+        "--cutoff-minutes", type=int, default=15,
         help="Minutes before session close to flatten (default: 15)",
     )
     parser.add_argument(
-        "--min-hold-bars",
-        type=int,
-        default=0,
-        help="Minimum bars to hold before allowing exit (default: 0)",
+        "--min-hold-bars", type=int, default=5,
+        help="Minimum bars to hold before allowing exit (default: 5)",
     )
     parser.add_argument(
-        "--skip-first-minutes",
-        type=int,
-        default=0,
-        help="Skip first N minutes of RTH session (default: 0)",
+        "--skip-first-minutes", type=int, default=30,
+        help="Skip first N minutes of RTH session (default: 30)",
+    )
+    parser.add_argument(
+        "--lookback", type=int, default=60,
+        help="Rolling lookback window in bars for z-score (default: 60)",
+    )
+    parser.add_argument(
+        "--z-entry", type=float, default=2.0,
+        help="Z-score threshold for entry (default: 2.0)",
+    )
+    parser.add_argument(
+        "--z-exit", type=float, default=0.5,
+        help="Z-score threshold for exit (default: 0.5)",
+    )
+    parser.add_argument(
+        "--confirm-bars", type=int, default=3,
+        help="Confirmation bars before entry (default: 3)",
+    )
+    parser.add_argument(
+        "--momentum-window", type=int, default=20,
+        help="Bars for momentum regime filter (default: 20)",
+    )
+    parser.add_argument(
+        "--momentum-threshold", type=float, default=0.7,
+        help="Fraction threshold for trending detection (default: 0.7)",
     )
 
     # Engine parameters
@@ -237,6 +243,12 @@ def main() -> None:
         session_cutoff_minutes=args.cutoff_minutes,
         min_hold_bars=args.min_hold_bars,
         skip_first_minutes=args.skip_first_minutes,
+        lookback_bars=args.lookback,
+        z_entry_threshold=args.z_entry,
+        z_exit_threshold=args.z_exit,
+        confirm_bars=args.confirm_bars,
+        momentum_filter_window=args.momentum_window,
+        momentum_threshold=args.momentum_threshold,
     )
 
     # Build engine config

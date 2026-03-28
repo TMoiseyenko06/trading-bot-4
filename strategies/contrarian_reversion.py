@@ -1,7 +1,9 @@
-"""Intraday contrarian mean-reversion basket strategy.
+"""Intraday contrarian mean-reversion basket strategy (v2).
 
 Computes cross-sectional deviations from the equally-weighted market return
-over a rolling signal window, volatility-normalizes, and fades outliers.
+using a rolling z-score (not fixed windows), volatility-normalizes, and
+fades outliers. Includes momentum regime filter and confirmation bars.
+
 Always dollar-neutral. All instruments entered and exited as a group.
 No overnight positions.
 """
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -25,102 +28,104 @@ logger = logging.getLogger(__name__)
 class _InstrumentData:
     """Per-instrument rolling state for signal calculation."""
 
-    # Signal window tracking
-    window_open_price: Optional[float] = None
-    window_volume: int = 0
-    prior_window_volume: int = 0
+    # Rolling price/return history
+    close_history: deque = field(default_factory=lambda: deque(maxlen=200))
+    return_history: deque = field(default_factory=lambda: deque(maxlen=200))
+    deviation_history: deque = field(default_factory=lambda: deque(maxlen=200))
+    volume_history: deque = field(default_factory=lambda: deque(maxlen=200))
 
-    # Intraday ATR state (session-anchored)
-    session_highs: list[float] = field(default_factory=list)
-    session_lows: list[float] = field(default_factory=list)
-    session_closes: list[float] = field(default_factory=list)
-    prev_close: Optional[float] = None
-    atr_value: Optional[float] = None
+    # Current bar values
+    current_close: float = 0.0
+    current_return: float = 0.0  # 1-bar return
+    prev_close: float = 0.0
 
-    # Current computed values
-    return_pct: float = 0.0
-    deviation: float = 0.0
+    # Rolling statistics
+    deviation: float = 0.0        # d_i = R_i - R_m (current bar)
+    z_score: float = 0.0          # z_i = d_i / std(d_i) over lookback
+    rolling_vol: float = 0.0      # std of returns over lookback
     raw_weight: float = 0.0
     normalized_weight: float = 0.0
-    volume_change: float = 0.0  # ln(vol_current / vol_prior)
 
-    # Entry state (when in a trade)
+    # Confirmation tracking
+    signal_direction: int = 0     # -1 or +1 when confirming, 0 otherwise
+    confirm_count: int = 0        # consecutive bars signal has persisted
+
+    # Entry state
     entry_deviation: float = 0.0
+    entry_z_score: float = 0.0
     entry_price: float = 0.0
+
+    # ATR for stop loss (Wilder's smoothing)
+    atr_value: Optional[float] = None
+    atr_prev_close: Optional[float] = None
 
     def reset_session(self) -> None:
         """Reset session-anchored data at session open."""
-        self.session_highs.clear()
-        self.session_lows.clear()
-        self.session_closes.clear()
-        self.prev_close = None
+        self.close_history.clear()
+        self.return_history.clear()
+        self.deviation_history.clear()
+        self.volume_history.clear()
+        self.current_close = 0.0
+        self.current_return = 0.0
+        self.prev_close = 0.0
+        self.deviation = 0.0
+        self.z_score = 0.0
+        self.rolling_vol = 0.0
+        self.raw_weight = 0.0
+        self.normalized_weight = 0.0
+        self.signal_direction = 0
+        self.confirm_count = 0
         self.atr_value = None
-        self.window_open_price = None
-        self.window_volume = 0
-        self.prior_window_volume = 0
-
-    def reset_window(self, open_price: float) -> None:
-        """Reset for a new signal window."""
-        self.prior_window_volume = max(1, self.window_volume)
-        self.window_open_price = open_price
-        self.window_volume = 0
+        self.atr_prev_close = None
 
     def update_atr(self, high: float, low: float, close: float) -> None:
-        """Incrementally update intraday ATR using all session bars."""
-        self.session_highs.append(high)
-        self.session_lows.append(low)
-        self.session_closes.append(close)
-
-        n = len(self.session_closes)
-        if n < 2:
-            self.atr_value = high - low if high - low > 0 else None
-            self.prev_close = close
+        """Incrementally update ATR using Wilder's smoothing (14-period)."""
+        if self.atr_prev_close is None:
+            self.atr_value = high - low if high > low else 0.001
+            self.atr_prev_close = close
             return
 
-        # Compute true range for this bar
         tr = max(
             high - low,
-            abs(high - self.prev_close) if self.prev_close else high - low,
-            abs(low - self.prev_close) if self.prev_close else high - low,
+            abs(high - self.atr_prev_close),
+            abs(low - self.atr_prev_close),
         )
-        self.prev_close = close
+        self.atr_prev_close = close
 
-        # Simple running ATR over all session bars
         if self.atr_value is None:
             self.atr_value = tr
         else:
-            # Wilder's smoothing with session length as period
-            period = min(n, 14)
-            self.atr_value = (
-                self.atr_value * (period - 1) + tr
-            ) / period
+            self.atr_value = (self.atr_value * 13 + tr) / 14
 
 
 class ContraMeanReversionStrategy(MultiInstrumentStrategy):
-    """Intraday contrarian mean-reversion across US equity index futures.
+    """Intraday contrarian mean-reversion across US equity index futures (v2).
 
-    Parameters:
-        signal_window_minutes: Length of the signal computation window (default 30)
-        theta: Deviation threshold for entry. If None, calibrates to 1 std dev
-               of observed deviations during the first session.
-        atr_period: Not used directly — ATR is session-anchored by default.
-        stop_multiple: Exit if deviation widens beyond this * sigma (default 2.0)
-        max_position_pct: Max position per instrument as fraction of capital (default 0.10)
-        session_cutoff_minutes: Minutes before RTH close to flatten (default 15)
+    Key improvements over v1:
+    - Rolling z-score signal (continuous, not fixed-window reset)
+    - Momentum regime filter (skip trending markets)
+    - Confirmation bars (deviation must persist before entry)
+    - Rolling return volatility for cross-sectional normalization
     """
 
     def __init__(
         self,
         name: str = "Contra_MeanRev",
-        signal_window_minutes: int = 30,
+        signal_window_minutes: int = 60,
         theta: Optional[float] = None,
-        theta_multiplier: float = 1.0,
-        stop_multiple: float = 2.0,
-        target_fraction: float = 0.5,
+        theta_multiplier: float = 1.5,
+        stop_multiple: float = 3.0,
+        target_fraction: float = 0.4,
         max_position_pct: float = 0.10,
         session_cutoff_minutes: int = 15,
-        min_hold_bars: int = 0,
-        skip_first_minutes: int = 0,
+        min_hold_bars: int = 5,
+        skip_first_minutes: int = 30,
+        lookback_bars: int = 60,
+        z_entry_threshold: float = 2.0,
+        z_exit_threshold: float = 0.5,
+        confirm_bars: int = 3,
+        momentum_filter_window: int = 20,
+        momentum_threshold: float = 0.7,
     ) -> None:
         super().__init__(name)
         self._window_minutes = signal_window_minutes
@@ -133,18 +138,25 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         self._cutoff_minutes = session_cutoff_minutes
         self._min_hold_bars = min_hold_bars
         self._skip_first_minutes = skip_first_minutes
+        self._lookback_bars = lookback_bars
+        self._z_entry = z_entry_threshold
+        self._z_exit = z_exit_threshold
+        self._confirm_bars = confirm_bars
+        self._momentum_window = momentum_filter_window
+        self._momentum_threshold = momentum_threshold
 
         # Runtime state
         self._symbols: list[str] = []
         self._data: dict[str, _InstrumentData] = {}
         self._in_trade: bool = False
         self._trade_entry_bar: int = 0
-        self._bars_in_window: int = 0
-        self._bars_per_window: int = 0
         self._session_active: bool = False
         self._past_cutoff: bool = False
-        self._session_pnl: float = 0.0
         self._session_bars: int = 0
+        self._skip_first_bars: int = 0
+
+        # Rolling market return history for momentum filter
+        self._market_return_history: deque = deque(maxlen=200)
 
         # Theta calibration
         self._calibration_deviations: list[float] = []
@@ -159,30 +171,25 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
             self._data[sym] = _InstrumentData()
 
         logger.info(
-            "ContraMeanRev initialized: instruments=%s, window=%dm, "
-            "theta=%s (x%.1f), stop=%.1fx, target_frac=%.2f, cutoff=%dm, "
-            "min_hold=%d bars, skip_first=%dm",
-            self._symbols,
-            self._window_minutes,
-            self._theta if self._theta else "auto-calibrate",
-            self._theta_multiplier,
-            self._stop_multiple,
-            self._target_fraction,
-            self._cutoff_minutes,
-            self._min_hold_bars,
-            self._skip_first_minutes,
+            "ContraMeanRev v2: instruments=%s, lookback=%d bars, "
+            "z_entry=%.1f, z_exit=%.1f, confirm=%d bars, "
+            "stop=%.1fx, theta_mult=%.1f, momentum_thresh=%.1f, "
+            "skip_first=%dm, min_hold=%d bars",
+            self._symbols, self._lookback_bars,
+            self._z_entry, self._z_exit, self._confirm_bars,
+            self._stop_multiple, self._theta_multiplier,
+            self._momentum_threshold,
+            self._skip_first_minutes, self._min_hold_bars,
         )
 
     def on_bar(
         self, state: MultiInstrumentState, submit_order: MultiSubmitFn
     ) -> None:
-        # Need all instruments to have data
         if not state.has_all_instruments(self._symbols):
             return
 
         session = state.session
 
-        # Handle session transitions
         if session.session_open_bar:
             self._on_session_open(state)
 
@@ -191,198 +198,234 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
 
         self._session_bars += 1
 
-        # Infer bars per window from bar duration
-        if self._bars_per_window == 0:
+        # Compute skip threshold on first bar
+        if self._skip_first_bars == 0 and self._skip_first_minutes > 0:
             any_bar = state.instruments[self._symbols[0]].bar
             bar_minutes = max(1, any_bar.duration_ns // 60_000_000_000)
-            self._bars_per_window = max(1, self._window_minutes // bar_minutes)
-            self._skip_first_bars = max(1, self._skip_first_minutes // bar_minutes) if self._skip_first_minutes > 0 else 0
+            self._skip_first_bars = max(1, self._skip_first_minutes // bar_minutes)
 
-        # Skip first N minutes of session (let opening noise settle)
+        # Skip opening noise
         if self._skip_first_minutes > 0 and self._session_bars <= self._skip_first_bars:
+            # Still update prices so we have history when we start trading
+            for sym in self._symbols:
+                bar = state.instruments[sym].bar
+                data = self._data[sym]
+                data.current_close = bar.close
+                data.update_atr(bar.high, bar.low, bar.close)
+                if data.prev_close > 0:
+                    data.current_return = (bar.close - data.prev_close) / data.prev_close
+                data.prev_close = bar.close
             return
 
-        # Update per-instrument ATR and volume
-        for sym in self._symbols:
-            inst = state.instruments[sym]
-            bar = inst.bar
-            data = self._data[sym]
-            data.update_atr(bar.high, bar.low, bar.close)
-            data.window_volume += bar.volume
+        # --- Core signal computation (every bar) ---
+        self._update_returns(state)
+        self._compute_deviations(state)
+        self._compute_z_scores()
+        self._compute_weights()
 
-            # Initialize window open if needed
-            if data.window_open_price is None:
-                data.window_open_price = bar.open
-
-        self._bars_in_window += 1
-
-        # Check session cutoff
+        # Session cutoff
         if session.minutes_to_session_close <= self._cutoff_minutes:
             if not self._past_cutoff:
                 self._past_cutoff = True
-                logger.info(
-                    "[%s] SESSION CUTOFF — %d min to close, flattening all",
-                    self.name,
-                    int(session.minutes_to_session_close),
-                )
+                logger.info("[%s] SESSION CUTOFF — flattening all", self.name)
             if self._in_trade:
                 self._exit_all(state, submit_order, reason="SESSION_CUTOFF")
             return
 
-        # Continuously monitor exits if in a trade
+        # If in trade, check exits continuously
         if self._in_trade:
-            self._compute_signals(state)
             self._check_exits(state, submit_order)
-            self._update_display(state)
             return
 
-        # Signal window complete?
-        if self._bars_in_window >= self._bars_per_window:
-            self._compute_signals(state)
-            self._update_display(state)
-
-            # Calibrate theta if needed
-            if self._theta_auto and not self._calibrated:
-                self._collect_calibration_data()
-                # Reset window
-                self._reset_window(state)
-                return
-
-            # Check filters and enter
-            if self._check_filters():
+        # Not in trade — check for entry signal
+        if self._session_bars >= self._lookback_bars:
+            if self._check_entry_signal(state):
                 self._enter_basket(state, submit_order)
-
-            # Reset window
-            self._reset_window(state)
 
     def on_fill(self, symbol: str, fill: Fill) -> None:
         logger.debug(
-            "  [%s] FILL %s: %s %d @ %.2f (slip: %.1f ticks, comm: $%.2f)",
-            self.name,
-            symbol,
-            fill.side.value,
-            fill.quantity,
-            fill.fill_price,
-            fill.slippage_ticks,
-            fill.commission,
+            "  [%s] FILL %s: %s %d @ %.2f",
+            self.name, symbol, fill.side.value,
+            fill.quantity, fill.fill_price,
         )
 
     def on_end(self) -> None:
-        logger.info(
-            "[%s] Strategy complete. Total session PnL tracked: $%.2f",
-            self.name,
-            self._session_pnl,
-        )
+        logger.info("[%s] Strategy complete.", self.name)
 
     # ------------------------------------------------------------------ #
-    # Signal computation
+    # Signal computation (runs every bar)
     # ------------------------------------------------------------------ #
 
-    def _compute_signals(self, state: MultiInstrumentState) -> None:
-        """Compute R_i, R_m, d_i, sigma_i, w_i for all instruments."""
-        n = len(self._symbols)
-
-        # Step 1-2: Compute per-instrument returns
+    def _update_returns(self, state: MultiInstrumentState) -> None:
+        """Update 1-bar returns and price history for all instruments."""
         for sym in self._symbols:
-            data = self._data[sym]
             bar = state.instruments[sym].bar
-            if data.window_open_price and data.window_open_price != 0:
-                data.return_pct = (
-                    (bar.close - data.window_open_price) / data.window_open_price
-                )
+            data = self._data[sym]
+
+            data.current_close = bar.close
+            data.update_atr(bar.high, bar.low, bar.close)
+            data.volume_history.append(bar.volume)
+
+            if data.prev_close > 0:
+                data.current_return = (bar.close - data.prev_close) / data.prev_close
             else:
-                data.return_pct = 0.0
+                data.current_return = 0.0
 
-        # Step 3: Market return (equally weighted)
-        r_m = sum(self._data[s].return_pct for s in self._symbols) / n
+            data.close_history.append(bar.close)
+            data.return_history.append(data.current_return)
+            data.prev_close = bar.close
 
-        # Step 4: Deviations
-        for sym in self._symbols:
-            self._data[sym].deviation = self._data[sym].return_pct - r_m
+    def _compute_deviations(self, state: MultiInstrumentState) -> None:
+        """Compute cross-sectional deviation d_i = R_i - R_m for this bar."""
+        n = len(self._symbols)
+        r_m = sum(self._data[s].current_return for s in self._symbols) / n
 
-        # Step 5: ATR already computed incrementally
+        self._market_return_history.append(r_m)
 
-        # Step 6: Raw weights = -1 * (d_i / sigma_i)
         for sym in self._symbols:
             data = self._data[sym]
-            sigma = data.atr_value
-            if sigma and sigma > 0:
-                # Normalize deviation by ATR expressed as % of price
-                bar = state.instruments[sym].bar
-                sigma_pct = sigma / bar.close if bar.close > 0 else 1.0
-                data.raw_weight = -1.0 * (data.deviation / sigma_pct)
+            data.deviation = data.current_return - r_m
+            data.deviation_history.append(data.deviation)
+
+        self._display["R_m"] = r_m
+
+    def _compute_z_scores(self) -> None:
+        """Compute rolling z-score of deviations for each instrument."""
+        lb = self._lookback_bars
+
+        for sym in self._symbols:
+            data = self._data[sym]
+            devs = data.deviation_history
+
+            if len(devs) < lb:
+                data.z_score = 0.0
+                data.rolling_vol = 0.0
+                continue
+
+            # Rolling mean and std of deviations over lookback
+            recent = list(devs)[-lb:]
+            mean_d = sum(recent) / lb
+            var_d = sum((x - mean_d) ** 2 for x in recent) / lb
+            std_d = math.sqrt(var_d) if var_d > 0 else 1e-10
+
+            data.z_score = (data.deviation - mean_d) / std_d
+
+            # Also compute rolling return vol for weighting
+            rets = list(data.return_history)[-lb:]
+            mean_r = sum(rets) / lb
+            var_r = sum((x - mean_r) ** 2 for x in rets) / lb
+            data.rolling_vol = math.sqrt(var_r) if var_r > 0 else 1e-10
+
+    def _compute_weights(self) -> None:
+        """Compute dollar-neutral weights from z-scores."""
+        # Raw weight: fade the z-score (buy underperformers, sell overperformers)
+        # Normalize by rolling vol to equalize risk contribution
+        for sym in self._symbols:
+            data = self._data[sym]
+            if data.rolling_vol > 0:
+                data.raw_weight = -data.z_score / data.rolling_vol
             else:
                 data.raw_weight = 0.0
 
-        # Step 7: Force zero-sum then normalize so sum(|w_i|) == 1
-        # Dividing d_i by sigma_i breaks zero-sum (since sigmas differ per instrument),
-        # so we demean the raw weights to restore dollar neutrality before normalizing.
-        n_syms = len(self._symbols)
-        mean_raw = sum(self._data[s].raw_weight for s in self._symbols) / n_syms
+        # Demean to force dollar neutrality
+        n = len(self._symbols)
+        mean_w = sum(self._data[s].raw_weight for s in self._symbols) / n
         for sym in self._symbols:
-            self._data[sym].raw_weight -= mean_raw
+            self._data[sym].raw_weight -= mean_w
 
+        # Normalize so sum(|w_i|) == 1
         total_abs = sum(abs(self._data[s].raw_weight) for s in self._symbols)
         if total_abs > 0:
             for sym in self._symbols:
-                self._data[sym].normalized_weight = (
-                    self._data[sym].raw_weight / total_abs
-                )
+                self._data[sym].normalized_weight = self._data[sym].raw_weight / total_abs
         else:
             for sym in self._symbols:
                 self._data[sym].normalized_weight = 0.0
 
-        # Verify dollar neutrality
-        weight_sum = sum(self._data[s].normalized_weight for s in self._symbols)
-        if abs(weight_sum) > 1e-6:
-            logger.error(
-                "DOLLAR NEUTRALITY VIOLATED: sum(w_i) = %.10f", weight_sum
-            )
+    # ------------------------------------------------------------------ #
+    # Entry logic
+    # ------------------------------------------------------------------ #
 
-        # Volume filter: v_i = ln(vol_current / vol_prior)
+    def _check_entry_signal(self, state: MultiInstrumentState) -> bool:
+        """Check if entry conditions are met: z-score threshold + confirmation + regime."""
+
+        # 1. Z-score threshold: at least one instrument must exceed z_entry
+        max_abs_z = max(abs(self._data[s].z_score) for s in self._symbols)
+        if max_abs_z < self._z_entry:
+            # Reset confirmation counter
+            for sym in self._symbols:
+                self._data[sym].confirm_count = 0
+                self._data[sym].signal_direction = 0
+            return False
+
+        # 2. Momentum regime filter: skip if market is trending
+        if self._is_trending():
+            for sym in self._symbols:
+                self._data[sym].confirm_count = 0
+                self._data[sym].signal_direction = 0
+            return False
+
+        # 3. Confirmation: the z-score signal must persist for N consecutive bars
+        #    Direction = sign of the strongest z-score instrument's weight
+        strongest_sym = max(self._symbols, key=lambda s: abs(self._data[s].z_score))
+        current_dir = -1 if self._data[strongest_sym].z_score > 0 else 1  # fade it
+
+        all_confirmed = True
         for sym in self._symbols:
             data = self._data[sym]
-            if data.prior_window_volume > 0 and data.window_volume > 0:
-                data.volume_change = math.log(
-                    data.window_volume / data.prior_window_volume
-                )
+            # Check if this instrument's signal direction is consistent
+            sym_dir = -1 if data.z_score > 0 else 1 if data.z_score < 0 else 0
+
+            if sym_dir == data.signal_direction and sym_dir != 0:
+                data.confirm_count += 1
             else:
-                data.volume_change = 0.0
+                data.signal_direction = sym_dir
+                data.confirm_count = 1
 
-        # Store R_m for display
-        self._display["R_m"] = r_m
-
-    # ------------------------------------------------------------------ #
-    # Filters
-    # ------------------------------------------------------------------ #
-
-    def _check_filters(self) -> bool:
-        """Check deviation threshold filter AND volume filter."""
-        if self._theta is None:
+        # The strongest instrument must have confirmed
+        if self._data[strongest_sym].confirm_count < self._confirm_bars:
             return False
 
-        # FILTER 1: Deviation threshold
-        max_dev = max(abs(self._data[s].deviation) for s in self._symbols)
-        if max_dev <= self._theta:
-            return False
-
-        # FILTER 2: Volume — instrument with largest |d_i| must have v_i > 0
-        largest_dev_sym = max(
-            self._symbols, key=lambda s: abs(self._data[s].deviation)
-        )
-        if self._data[largest_dev_sym].volume_change <= 0:
-            logger.debug(
-                "Volume filter blocked entry: %s v_i=%.4f",
-                largest_dev_sym,
-                self._data[largest_dev_sym].volume_change,
-            )
-            return False
+        # 4. Volume confirmation on the strongest deviator
+        data = self._data[strongest_sym]
+        if len(data.volume_history) >= 2:
+            recent_vol = list(data.volume_history)[-1]
+            prev_vol = list(data.volume_history)[-2]
+            if prev_vol > 0 and recent_vol > 0:
+                if math.log(recent_vol / prev_vol) <= 0:
+                    return False
 
         return True
 
-    # ------------------------------------------------------------------ #
-    # Entry
-    # ------------------------------------------------------------------ #
+    def _is_trending(self) -> bool:
+        """Check if the market is in a momentum regime (all instruments trending same way)."""
+        if len(self._market_return_history) < self._momentum_window:
+            return False
+
+        recent_market = list(self._market_return_history)[-self._momentum_window:]
+        positive = sum(1 for r in recent_market if r > 0)
+        fraction = positive / self._momentum_window
+
+        # If > threshold of bars are positive or negative, market is trending
+        if fraction > self._momentum_threshold or fraction < (1 - self._momentum_threshold):
+            return True
+
+        # Also check if all instruments are moving same direction consistently
+        n = len(self._symbols)
+        same_dir = 0
+        for sym in self._symbols:
+            rets = list(self._data[sym].return_history)
+            if len(rets) >= self._momentum_window:
+                recent = rets[-self._momentum_window:]
+                pos_frac = sum(1 for r in recent if r > 0) / self._momentum_window
+                if pos_frac > self._momentum_threshold or pos_frac < (1 - self._momentum_threshold):
+                    same_dir += 1
+
+        # If most instruments are trending, skip
+        if same_dir >= n * 0.75:
+            return True
+
+        return False
 
     def _enter_basket(
         self, state: MultiInstrumentState, submit_order: MultiSubmitFn
@@ -391,6 +434,10 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         if self._in_trade:
             return
 
+        from engine.contract_registry import ContractRegistry
+        registry = ContractRegistry()
+
+        entered = False
         for sym in self._symbols:
             data = self._data[sym]
             w = data.normalized_weight
@@ -398,17 +445,9 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
                 continue
 
             bar = state.instruments[sym].bar
-            spec = None
-            # Compute position size from weight
-            # weight magnitude * capital = target notional
-            # contracts = notional / (price * point_value)
-            from engine.contract_registry import ContractRegistry
-
-            registry = ContractRegistry()
             spec = registry.get(sym)
 
             target_notional = abs(w) * state.equity
-            # Cap at max_position_pct of capital
             max_notional = self._max_pos_pct * state.equity
             target_notional = min(target_notional, max_notional)
 
@@ -428,78 +467,75 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
 
             result = submit_order(sym, order)
             if result:
+                entered = True
                 data.entry_deviation = data.deviation
+                data.entry_z_score = data.z_score
                 data.entry_price = bar.close
                 logger.info(
-                    "  [%s] ENTRY %s: %s %d contracts, w=%.4f, d_i=%.6f",
-                    self.name,
-                    sym,
-                    side.value,
-                    contracts,
-                    w,
-                    data.deviation,
+                    "  [%s] ENTRY %s: %s %d contracts, w=%.4f, z=%.2f, d_i=%.6f",
+                    self.name, sym, side.value, contracts, w, data.z_score, data.deviation,
                 )
 
-        self._in_trade = True
-        self._trade_entry_bar = state.bar_index
+        if entered:
+            self._in_trade = True
+            self._trade_entry_bar = state.bar_index
 
     # ------------------------------------------------------------------ #
-    # Exit checks
+    # Exit logic
     # ------------------------------------------------------------------ #
 
     def _check_exits(
         self, state: MultiInstrumentState, submit_order: MultiSubmitFn
     ) -> None:
-        """Monitor all three exit conditions continuously."""
+        """Monitor exit conditions continuously."""
         if not self._in_trade:
             return
 
-        # Minimum hold period — don't exit too early
+        # Minimum hold period
         bars_held = state.bar_index - self._trade_entry_bar
         if self._min_hold_bars > 0 and bars_held < self._min_hold_bars:
             return
 
-        # TARGET EXIT: all |d_i| < theta * target_fraction for held positions
-        if self._theta is not None:
-            target_theta = self._theta * self._target_fraction
-            all_reverted = all(
-                abs(self._data[s].deviation) < target_theta
-                for s in self._symbols
-                if state.instruments[s].position_quantity > 0
-            )
-            if all_reverted:
-                self._exit_all(state, submit_order, reason="TARGET_REVERT")
-                return
+        # TARGET EXIT: z-scores have reverted (all below z_exit threshold)
+        all_reverted = all(
+            abs(self._data[s].z_score) < self._z_exit
+            for s in self._symbols
+            if state.instruments[s].position_quantity > 0
+        )
+        if all_reverted:
+            self._exit_all(state, submit_order, reason="TARGET_REVERT")
+            return
 
-        # STOP LOSS: any position's deviation widens beyond stop_multiple * sigma
+        # STOP LOSS: z-score has widened beyond stop_multiple of entry z-score
         for sym in self._symbols:
             inst = state.instruments[sym]
             if inst.position_quantity == 0:
                 continue
 
             data = self._data[sym]
-            sigma = data.atr_value
-            if sigma is None or sigma <= 0:
-                continue
 
-            bar = inst.bar
-            sigma_pct = sigma / bar.close if bar.close > 0 else 1.0
+            # Z-score stop: if current z is stop_multiple * entry z in the wrong direction
+            if abs(data.entry_z_score) > 0:
+                z_ratio = abs(data.z_score) / abs(data.entry_z_score)
+                if z_ratio > self._stop_multiple and abs(data.z_score) > self._z_entry:
+                    logger.warning(
+                        "  [%s] Z-SCORE STOP on %s: z=%.2f (entry=%.2f, ratio=%.1fx)",
+                        self.name, sym, data.z_score, data.entry_z_score, z_ratio,
+                    )
+                    self._exit_all(state, submit_order, reason="STOP_LOSS")
+                    return
 
-            # Deviation widening: entry_deviation had one sign, check if
-            # current deviation has moved further against us
-            dev_change = abs(data.deviation) - abs(data.entry_deviation)
-            if dev_change > self._stop_multiple * sigma_pct:
-                logger.warning(
-                    "  [%s] STOP LOSS triggered on %s: "
-                    "dev_change=%.6f > %.1f * sigma=%.6f",
-                    self.name,
-                    sym,
-                    dev_change,
-                    self._stop_multiple,
-                    sigma_pct,
-                )
-                self._exit_all(state, submit_order, reason="STOP_LOSS")
-                return
+            # ATR-based hard stop as backup
+            if data.atr_value and data.atr_value > 0:
+                bar = inst.bar
+                price_move = abs(bar.close - data.entry_price)
+                if price_move > self._stop_multiple * data.atr_value:
+                    logger.warning(
+                        "  [%s] ATR STOP on %s: move=%.2f > %.1f * ATR=%.2f",
+                        self.name, sym, price_move, self._stop_multiple, data.atr_value,
+                    )
+                    self._exit_all(state, submit_order, reason="ATR_STOP")
+                    return
 
     def _exit_all(
         self,
@@ -516,9 +552,7 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
             if inst.position_quantity == 0:
                 continue
 
-            side = (
-                OrderSide.SELL if inst.position_direction == 1 else OrderSide.BUY
-            )
+            side = OrderSide.SELL if inst.position_direction == 1 else OrderSide.BUY
             order = Order(
                 side=side,
                 quantity=inst.position_quantity,
@@ -528,15 +562,16 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
             result = submit_order(sym, order)
             if result:
                 logger.info(
-                    "  [%s] EXIT %s: %s %d contracts [%s]",
-                    self.name,
-                    sym,
-                    side.value,
-                    inst.position_quantity,
-                    reason,
+                    "  [%s] EXIT %s: %s %d contracts [%s] z=%.2f",
+                    self.name, sym, side.value, inst.position_quantity,
+                    reason, self._data[sym].z_score,
                 )
 
         self._in_trade = False
+        # Reset confirmation state
+        for sym in self._symbols:
+            self._data[sym].confirm_count = 0
+            self._data[sym].signal_direction = 0
 
     # ------------------------------------------------------------------ #
     # Session management
@@ -546,139 +581,59 @@ class ContraMeanReversionStrategy(MultiInstrumentStrategy):
         """Reset all session-anchored state."""
         for sym in self._symbols:
             self._data[sym].reset_session()
-            if sym in state.instruments:
-                bar = state.instruments[sym].bar
-                self._data[sym].window_open_price = bar.open
 
-        self._bars_in_window = 0
         self._session_active = True
         self._past_cutoff = False
         self._in_trade = False
-        self._session_pnl = 0.0
         self._session_bars = 0
+        self._skip_first_bars = 0
+        self._market_return_history.clear()
 
-        # After first session of calibration, compute theta
+        # Calibrate theta from prior sessions if needed
         if self._theta_auto and not self._calibrated and self._calibration_deviations:
             self._finalize_calibration()
 
         logger.info("[%s] Session open — state reset", self.name)
 
-    def _reset_window(self, state: MultiInstrumentState) -> None:
-        """Reset the signal window for the next computation period."""
-        for sym in self._symbols:
-            bar = state.instruments[sym].bar
-            self._data[sym].reset_window(bar.close)
-        self._bars_in_window = 0
-
     # ------------------------------------------------------------------ #
-    # Theta calibration
+    # Theta calibration (kept for backward compat, mostly unused in v2)
     # ------------------------------------------------------------------ #
-
-    def _collect_calibration_data(self) -> None:
-        """Collect deviation samples for auto-calibrating theta."""
-        for sym in self._symbols:
-            self._calibration_deviations.append(abs(self._data[sym].deviation))
 
     def _finalize_calibration(self) -> None:
-        """Set theta to 1 standard deviation of observed |d_i|."""
         if not self._calibration_deviations:
-            self._theta = 0.001  # Fallback
+            self._theta = 0.001
             self._calibrated = True
             return
 
         n = len(self._calibration_deviations)
         mean = sum(self._calibration_deviations) / n
-        variance = sum(
-            (x - mean) ** 2 for x in self._calibration_deviations
-        ) / max(1, n - 1)
+        variance = sum((x - mean) ** 2 for x in self._calibration_deviations) / max(1, n - 1)
         std = math.sqrt(variance)
-
         self._theta = std * self._theta_multiplier
         self._calibrated = True
         logger.info(
-            "[%s] Theta calibrated: %.6f (base_std=%.6f x %.1f, from %d samples, mean=%.6f)",
-            self.name,
-            self._theta,
-            std,
-            self._theta_multiplier,
-            n,
-            mean,
+            "[%s] Theta calibrated: %.6f (std=%.6f x %.1f, %d samples)",
+            self.name, self._theta, std, self._theta_multiplier, n,
         )
 
     # ------------------------------------------------------------------ #
     # Display / monitoring
     # ------------------------------------------------------------------ #
 
-    def _update_display(self, state: MultiInstrumentState) -> None:
-        """Update monitoring display data."""
-        self._display["in_trade"] = self._in_trade
-        self._display["theta"] = self._theta
-        self._display["calibrated"] = self._calibrated
-        self._display["session_pnl"] = state.total_realized_pnl
-
-        for sym in self._symbols:
-            data = self._data[sym]
-            inst = state.instruments.get(sym)
-            self._display[f"{sym}_d_i"] = data.deviation
-            self._display[f"{sym}_R_i"] = data.return_pct
-            self._display[f"{sym}_w_i"] = data.normalized_weight
-            self._display[f"{sym}_sigma"] = data.atr_value
-            self._display[f"{sym}_v_i"] = data.volume_change
-
-            if inst and inst.position_quantity > 0:
-                self._display[f"{sym}_entry_d_i"] = data.entry_deviation
-                self._display[f"{sym}_pos"] = (
-                    inst.position_direction * inst.position_quantity
-                )
-
-                # Stop loss proximity warning
-                if data.atr_value and data.atr_value > 0:
-                    bar = inst.bar
-                    sigma_pct = data.atr_value / bar.close if bar.close > 0 else 1
-                    dev_change = abs(data.deviation) - abs(data.entry_deviation)
-                    stop_dist = self._stop_multiple * sigma_pct
-                    if dev_change > stop_dist * 0.75:
-                        self._display[f"{sym}_STOP_WARNING"] = (
-                            f"APPROACHING STOP: {dev_change:.6f} / {stop_dist:.6f}"
-                        )
-                    elif f"{sym}_STOP_WARNING" in self._display:
-                        del self._display[f"{sym}_STOP_WARNING"]
-
-        # Session cutoff warning
-        if state.session.minutes_to_session_close <= self._cutoff_minutes * 2:
-            self._display["CUTOFF_WARNING"] = (
-                f"{state.session.minutes_to_session_close:.0f} min to close"
-            )
-
     def get_display(self) -> dict:
-        """Get current monitoring display data (for external consumers)."""
         return dict(self._display)
 
     def print_status(self) -> None:
-        """Print current status to stdout."""
         d = self._display
         print(f"\n--- {self.name} Status ---")
         print(f"  R_m = {d.get('R_m', 0):.6f}")
-        print(f"  Theta = {d.get('theta', 'N/A')}")
-        print(f"  In Trade = {d.get('in_trade', False)}")
-        print(f"  Session PnL = ${d.get('session_pnl', 0):,.2f}")
+        print(f"  In Trade = {self._in_trade}")
         print()
         for sym in self._symbols:
-            line = f"  {sym}: d_i={d.get(f'{sym}_d_i', 0):.6f}"
-            line += f"  R_i={d.get(f'{sym}_R_i', 0):.6f}"
-            line += f"  w_i={d.get(f'{sym}_w_i', 0):.4f}"
-            sigma = d.get(f'{sym}_sigma')
-            line += f"  σ={sigma:.4f}" if sigma else "  σ=N/A"
-            pos = d.get(f"{sym}_pos")
-            if pos:
-                line += f"  POS={pos:+d}"
-                line += f"  entry_d={d.get(f'{sym}_entry_d_i', 0):.6f}"
-            warn = d.get(f"{sym}_STOP_WARNING")
-            if warn:
-                line += f"  ⚠ {warn}"
+            data = self._data[sym]
+            line = f"  {sym}: z={data.z_score:+.2f}  d_i={data.deviation:.6f}"
+            line += f"  w_i={data.normalized_weight:.4f}"
+            line += f"  vol={data.rolling_vol:.6f}"
+            line += f"  confirm={data.confirm_count}/{self._confirm_bars}"
             print(line)
-
-        cutoff = d.get("CUTOFF_WARNING")
-        if cutoff:
-            print(f"  ⚠ CUTOFF: {cutoff}")
         print()
