@@ -111,8 +111,8 @@ Examples:
     parser.add_argument(
         "--slippage-ticks",
         type=float,
-        default=1.0,
-        help="Slippage in ticks (default: 1.0)",
+        default=0.0,
+        help="Slippage in ticks (default: 0.0)",
     )
 
     # Output

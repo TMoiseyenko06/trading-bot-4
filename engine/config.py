@@ -21,7 +21,7 @@ class SessionFilter(Enum):
 @dataclass
 class SlippageConfig:
     model: SlippageModel = SlippageModel.FIXED
-    fixed_ticks: float = 1.0
+    fixed_ticks: float = 0.0
     # For normal distribution model
     normal_mean_ticks: float = 1.0
     normal_std_ticks: float = 0.5
