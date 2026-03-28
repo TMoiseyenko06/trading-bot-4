@@ -16,6 +16,7 @@ import argparse
 import csv
 import itertools
 import logging
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -205,6 +206,28 @@ def save_results_csv(results: list[SearchResult], path: str) -> None:
     print(f"\nResults saved to: {path}")
 
 
+def _worker(args_tuple) -> SearchResult | str:
+    """Worker function for multiprocessing. Returns SearchResult or error string."""
+    dbn_source, instruments, params_dict, capital, max_contracts = args_tuple
+
+    # Suppress logging in worker processes
+    logging.disable(logging.CRITICAL)
+
+    params = ParamSet(**params_dict)
+    try:
+        return run_single(
+            dbn_source=dbn_source,
+            instruments=instruments,
+            is_single_file=True,
+            params=params,
+            capital=capital,
+            max_contracts=max_contracts,
+            registry=ContractRegistry(),
+        )
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 def parse_float_list(s: str) -> list[float]:
     """Parse comma-separated float values."""
     return [float(x.strip()) for x in s.split(",")]
@@ -272,6 +295,12 @@ Examples:
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--max-contracts", type=int, default=20)
 
+    # Parallelism
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Number of parallel workers. 0=auto (all CPU cores), 1=sequential (default: 0)",
+    )
+
     # Output
     parser.add_argument(
         "--output", type=str, default="results_grid/grid_search_results.csv",
@@ -318,15 +347,19 @@ Examples:
     print(f"  Skip first mins:   {skip_firsts}")
     print()
     print(f"  Total combinations: {total}")
+
+    # Determine worker count
+    num_workers = args.workers if args.workers > 0 else mp.cpu_count()
+    sequential = num_workers == 1
+
+    print(f"  Workers: {num_workers} {'(sequential)' if sequential else f'(parallel across {num_workers} CPU cores)'}")
     print("=" * 60)
     print()
 
-    registry = ContractRegistry()
-    results: list[SearchResult] = []
-    start_time = time.time()
-
-    for i, (win, tm, sm, tf, mh, sf) in enumerate(combos, 1):
-        params = ParamSet(
+    # Build worker arguments — use dicts since dataclasses may not pickle across processes
+    worker_args = []
+    for win, tm, sm, tf, mh, sf in combos:
+        params_dict = dict(
             window=win,
             theta_multiplier=tm,
             stop_multiple=sm,
@@ -334,38 +367,70 @@ Examples:
             min_hold_bars=mh,
             skip_first_minutes=sf,
         )
+        worker_args.append((
+            args.dbn_file, instruments, params_dict,
+            args.capital, args.max_contracts,
+        ))
 
-        elapsed = time.time() - start_time
-        avg_per = elapsed / max(1, i - 1)
-        remaining = avg_per * (total - i + 1)
+    results: list[SearchResult] = []
+    start_time = time.time()
 
-        print(
-            f"[{i}/{total}] win={win}, theta_m={tm:.1f}, stop={sm:.1f}, "
-            f"tgt={tf:.2f}, hold={mh}, skip={sf}  "
-            f"(~{remaining/60:.0f}m remaining)",
-            end="",
-            flush=True,
-        )
-
-        try:
-            sr = run_single(
-                dbn_source=args.dbn_file,
-                instruments=instruments,
-                is_single_file=True,
-                params=params,
-                capital=args.capital,
-                max_contracts=args.max_contracts,
-                registry=registry,
+    if sequential:
+        # Sequential mode — same as before, with progress
+        registry = ContractRegistry()
+        for i, (win, tm, sm, tf, mh, sf) in enumerate(combos, 1):
+            params = ParamSet(
+                window=win, theta_multiplier=tm, stop_multiple=sm,
+                target_fraction=tf, min_hold_bars=mh, skip_first_minutes=sf,
             )
-            results.append(sr)
-
-            pf = f"{sr.profit_factor:.2f}" if sr.profit_factor < 100 else "inf"
+            elapsed = time.time() - start_time
+            avg_per = elapsed / max(1, i - 1)
+            remaining = avg_per * (total - i + 1)
             print(
-                f"  -> PF={pf}, WR={sr.win_rate:.1f}%, "
-                f"PnL=${sr.net_pnl:,.0f}, DD={sr.max_dd_pct:.1f}%"
+                f"[{i}/{total}] win={win}, theta_m={tm:.1f}, stop={sm:.1f}, "
+                f"tgt={tf:.2f}, hold={mh}, skip={sf}  "
+                f"(~{remaining/60:.0f}m remaining)",
+                end="", flush=True,
             )
-        except Exception as e:
-            print(f"  -> ERROR: {e}")
+            try:
+                sr = run_single(
+                    dbn_source=args.dbn_file, instruments=instruments,
+                    is_single_file=True, params=params,
+                    capital=args.capital, max_contracts=args.max_contracts,
+                    registry=registry,
+                )
+                results.append(sr)
+                pf = f"{sr.profit_factor:.2f}" if sr.profit_factor < 100 else "inf"
+                print(f"  -> PF={pf}, WR={sr.win_rate:.1f}%, PnL=${sr.net_pnl:,.0f}, DD={sr.max_dd_pct:.1f}%")
+            except Exception as e:
+                print(f"  -> ERROR: {e}")
+    else:
+        # Parallel mode — use process pool
+        completed = 0
+        print(f"Launching {total} backtests across {num_workers} workers...\n")
+
+        with mp.Pool(processes=num_workers) as pool:
+            for result in pool.imap_unordered(_worker, worker_args):
+                completed += 1
+                elapsed = time.time() - start_time
+                avg_per = elapsed / completed
+                remaining = avg_per * (total - completed)
+
+                if isinstance(result, str):
+                    # Error
+                    print(f"  [{completed}/{total}] {result}  (~{remaining/60:.0f}m remaining)")
+                else:
+                    results.append(result)
+                    p = result.params
+                    pf = f"{result.profit_factor:.2f}" if result.profit_factor < 100 else "inf"
+                    print(
+                        f"  [{completed}/{total}] win={p.window}, theta_m={p.theta_multiplier:.1f}, "
+                        f"stop={p.stop_multiple:.1f}, tgt={p.target_fraction:.2f}, "
+                        f"hold={p.min_hold_bars}, skip={p.skip_first_minutes}  "
+                        f"-> PF={pf}, WR={result.win_rate:.1f}%, "
+                        f"PnL=${result.net_pnl:,.0f}, DD={result.max_dd_pct:.1f}%  "
+                        f"(~{remaining/60:.0f}m remaining)"
+                    )
 
     total_time = time.time() - start_time
     print(f"\nGrid search complete in {total_time/60:.1f} minutes")
