@@ -163,6 +163,32 @@ class ContractRegistry:
                 description="Micro E-mini S&P 500 Futures",
             ),
             ContractSpec(
+                symbol="RTY",
+                exchange="CME",
+                tick_size=0.10,
+                point_value=50.0,
+                contract_multiplier=50.0,
+                commission_per_side=2.25,
+                initial_margin=7_150.0,
+                maintenance_margin=6_500.0,
+                intraday_margin=3_575.0,
+                session_hours=_CME_EQUITY_SESSION,
+                description="E-mini Russell 2000 Futures",
+            ),
+            ContractSpec(
+                symbol="M2K",
+                exchange="CME",
+                tick_size=0.10,
+                point_value=5.0,
+                contract_multiplier=5.0,
+                commission_per_side=0.62,
+                initial_margin=715.0,
+                maintenance_margin=650.0,
+                intraday_margin=357.5,
+                session_hours=_CME_EQUITY_SESSION,
+                description="Micro E-mini Russell 2000 Futures",
+            ),
+            ContractSpec(
                 symbol="YM",
                 exchange="CME",
                 tick_size=1.0,
@@ -236,7 +262,10 @@ class ContractRegistry:
 
         Accepts full contract identifiers like 'NQM5' and extracts the root.
         """
-        root = self.extract_root(symbol)
+        # Direct match first
+        if symbol in self._specs:
+            return self._specs[symbol]
+        root = self.extract_root(symbol, known_roots=set(self._specs.keys()))
         if root not in self._specs:
             raise KeyError(
                 f"No contract spec found for root symbol '{root}' "
@@ -249,38 +278,35 @@ class ContractRegistry:
         self._specs[spec.symbol] = spec
 
     @staticmethod
-    def extract_root(symbol: str) -> str:
+    def extract_root(
+        symbol: str, known_roots: set[str] | None = None
+    ) -> str:
         """Extract the root symbol from a full futures identifier.
 
-        Examples: 'NQM5' -> 'NQ', 'ESZ25' -> 'ES', 'NQ' -> 'NQ'
+        Examples: 'NQM5' -> 'NQ', 'ESZ25' -> 'ES', 'NQ' -> 'NQ',
+                  'M2KZ5' -> 'M2K', 'RTYM5' -> 'RTY'
         """
-        match = re.match(r"^([A-Z]+)", symbol)
-        if not match:
-            raise ValueError(f"Cannot extract root symbol from '{symbol}'")
-        root_candidate = match.group(1)
-        # Month codes: F G H J K M N Q U V X Z
         month_codes = "FGHJKMNQUVXZ"
-        # Try to split: if the last char of root_candidate is a month code
-        # and is followed by digits, strip it
-        if len(root_candidate) >= 2 and root_candidate[-1] in month_codes:
-            rest = symbol[len(root_candidate):]
-            if rest and rest[0].isdigit():
-                # The last char is a month code followed by year digits
-                return root_candidate[:-1]
-            # Also check if the original symbol after root_candidate starts
-            # with a digit (e.g., NQM5 -> root_candidate = "NQM", rest = "5")
-            # Already handled above
-        # Check known roots
-        for length in range(len(root_candidate), 0, -1):
-            candidate = root_candidate[:length]
-            if candidate in ("MNQ", "MES", "MYM"):
-                return candidate
-            remainder = symbol[length:]
-            if remainder and remainder[0] in month_codes:
-                rest_after_month = remainder[1:]
-                if rest_after_month and rest_after_month[0].isdigit():
+
+        # Try known roots first (longest match wins)
+        if known_roots:
+            for length in range(len(symbol), 0, -1):
+                candidate = symbol[:length]
+                if candidate in known_roots:
                     return candidate
-        return root_candidate
+
+        # Try splitting at each position: find shortest prefix where
+        # the remainder is month_code + year digits
+        for i in range(1, len(symbol) + 1):
+            prefix = symbol[:i]
+            rest = symbol[i:]
+            if rest and rest[0] in month_codes:
+                after_month = rest[1:]
+                if after_month and after_month[0].isdigit():
+                    return prefix
+
+        # No month+year suffix found — return the whole symbol as root
+        return symbol
 
     def list_symbols(self) -> list[str]:
         """List all registered root symbols."""
