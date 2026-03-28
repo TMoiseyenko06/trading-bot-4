@@ -52,32 +52,58 @@ class _InstrumentContext:
 class MultiInstrumentEngine:
     """Multi-instrument backtesting engine for basket strategies.
 
-    Reads multiple .dbn files simultaneously, synchronizes by timestamp,
-    and processes all instruments at each time step. Maintains per-instrument
-    positions with a shared equity pool.
+    Supports two data modes:
+      - Single .dbn file containing all instruments (pass dbn_path as str)
+      - Multiple .dbn files, one per instrument (pass dbn_paths as dict)
+
+    Maintains per-instrument positions with a shared equity pool.
     """
 
     def __init__(
         self,
-        dbn_paths: dict[str, str],
+        dbn_paths: dict[str, str] | str,
         strategy: "MultiInstrumentStrategy",
         config: EngineConfig,
+        instruments: list[str] | None = None,
         registry: ContractRegistry | None = None,
     ) -> None:
+        """
+        Args:
+            dbn_paths: Either a single .dbn file path (str) containing all
+                       instruments, or a dict mapping root_symbol -> file path.
+            strategy: Multi-instrument strategy instance.
+            config: Engine configuration.
+            instruments: Required when dbn_paths is a single file — the list
+                         of root symbols to trade (e.g. ["NQ", "ES", "RTY", "YM"]).
+            registry: Optional contract registry override.
+        """
         from strategies.multi_base import MultiInstrumentStrategy
 
-        self._dbn_paths = dbn_paths
         self._strategy = strategy
         self._config = config
         self._registry = registry or ContractRegistry()
 
+        # Determine data mode
+        if isinstance(dbn_paths, str):
+            # Single file mode
+            if not instruments:
+                raise ValueError(
+                    "When passing a single .dbn file, you must provide the "
+                    "'instruments' list (e.g. ['NQ', 'ES', 'RTY', 'YM'])"
+                )
+            self._feed = MultiInstrumentFeed.from_single_file(
+                dbn_paths, instruments
+            )
+            self._instrument_symbols = instruments
+        else:
+            # Multiple file mode
+            self._feed = MultiInstrumentFeed.from_multiple_files(dbn_paths)
+            self._instrument_symbols = list(dbn_paths.keys())
+
         # Per-instrument contexts
         self._instruments: dict[str, _InstrumentContext] = {}
-        for symbol in dbn_paths:
+        for symbol in self._instrument_symbols:
             spec = self._registry.get(symbol)
-            # Each instrument gets its own account tracker with shared
-            # initial capital divided equally for margin purposes,
-            # but we track a unified equity separately
             account = AccountTracker(
                 initial_capital=config.initial_capital,
                 contract_spec=spec,
@@ -104,12 +130,10 @@ class MultiInstrumentEngine:
 
     def run(self) -> dict:
         """Execute the multi-instrument backtest."""
-        feed = MultiInstrumentFeed(self._dbn_paths)
-
-        self._strategy.on_init(list(self._dbn_paths.keys()))
+        self._strategy.on_init(self._instrument_symbols)
 
         bar_count = 0
-        for multi_bar in feed:
+        for multi_bar in self._feed:
             self._process_multi_bar(multi_bar)
             bar_count += 1
 
