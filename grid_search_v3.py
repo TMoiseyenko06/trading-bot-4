@@ -170,8 +170,79 @@ CSV_COLUMNS = [
 ]
 
 
-def init_csv(path: str) -> None:
+PARAM_COLUMNS = [
+    "lookback_bars", "z_entry", "z_exit", "confirm_bars",
+    "stop_multiple", "momentum_threshold",
+    "min_hold_bars", "skip_first_minutes",
+    "z_spread_threshold", "volume_spike_multiple",
+    "per_leg_exit", "time_weight_enabled",
+    "require_z_widening", "leg_stop_atr_multiple",
+    "asymmetric_exit", "vol_regime_filter", "vol_regime_multiple",
+]
+
+
+def _combo_key(row: dict) -> tuple:
+    """Create a hashable key from parameter columns for dedup/resume."""
+    parts = []
+    for col in PARAM_COLUMNS:
+        val = row.get(col, "")
+        # Normalize: round floats, lowercase bools
+        try:
+            fval = float(val)
+            parts.append(round(fval, 6))
+        except (ValueError, TypeError):
+            parts.append(str(val).strip().lower())
+    return tuple(parts)
+
+
+def _params_to_key(p: V3ParamSet) -> tuple:
+    """Create a hashable key from a V3ParamSet."""
+    return (
+        round(float(p.lookback_bars), 6),
+        round(p.z_entry, 6),
+        round(p.z_exit, 6),
+        round(float(p.confirm_bars), 6),
+        round(p.stop_multiple, 6),
+        round(p.momentum_threshold, 6),
+        round(float(p.min_hold_bars), 6),
+        round(float(p.skip_first_minutes), 6),
+        round(p.z_spread_threshold, 6),
+        round(p.volume_spike_multiple, 6),
+        str(p.per_leg_exit).lower(),
+        str(p.time_weight_enabled).lower(),
+        str(p.require_z_widening).lower(),
+        round(p.leg_stop_atr_multiple, 6),
+        str(p.asymmetric_exit).lower(),
+        str(p.vol_regime_filter).lower(),
+        round(p.vol_regime_multiple, 6),
+    )
+
+
+def load_completed_keys(path: str) -> set[tuple]:
+    """Load parameter keys of already-completed runs from existing CSV."""
+    completed = set()
+    if not os.path.exists(path):
+        return completed
+
+    try:
+        with open(path, "r") as f:
+            reader = csv.DictReader(f)
+            # Verify the CSV has the right columns
+            if reader.fieldnames and all(c in reader.fieldnames for c in PARAM_COLUMNS):
+                for row in reader:
+                    completed.add(_combo_key(row))
+    except Exception as e:
+        print(f"  Warning: Could not read existing CSV for resume: {e}")
+        return set()
+
+    return completed
+
+
+def init_csv(path: str, resume: bool = False) -> None:
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    if resume and os.path.exists(path):
+        # Don't overwrite — we'll append
+        return
     with open(path, "w", newline="") as f:
         csv.writer(f).writerow(CSV_COLUMNS)
 
@@ -281,6 +352,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers (0=auto, default: 0)")
     parser.add_argument("--output", type=str, default="results_grid_v3/grid_v3_full_results.csv")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing CSV — skip already-completed combos")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -359,16 +432,46 @@ def main() -> None:
     print()
     print(f"  Total combinations: {total:,}")
     print(f"  Workers: {num_workers}")
+    print(f"  Resume mode: {args.resume}")
     print(f"  Estimated time: ~{est_hours:.1f} hours ({est_total_seconds/60:.0f} min)")
     print("=" * 70)
     print()
 
-    # Build worker arguments
+    csv_path = args.output
+
+    # --- Resume support: load already-completed combos ---
+    already_done = set()
+    if args.resume:
+        already_done = load_completed_keys(csv_path)
+        if already_done:
+            print(f"  RESUME: Found {len(already_done):,} completed combos in {csv_path}")
+        else:
+            print(f"  RESUME: No existing results found, starting fresh")
+
+    # Build worker arguments, skipping already-completed combos
     worker_args = []
+    skipped = 0
     for combo in combos:
         (lb, ze, zx, cb, sm, mt, mh, sf,
          zsp, vs, pl, tw,
          zw, lsa, asym, vrf, vrm) = combo
+
+        # Check if this combo was already completed
+        if args.resume and already_done:
+            params_obj = V3ParamSet(
+                lookback_bars=lb, z_entry=ze, z_exit=zx, confirm_bars=cb,
+                stop_multiple=sm, momentum_threshold=mt,
+                min_hold_bars=mh, skip_first_minutes=sf,
+                z_spread_threshold=zsp, volume_spike_multiple=vs,
+                per_leg_exit=pl, time_weight_enabled=tw,
+                require_z_widening=zw, leg_stop_atr_multiple=lsa,
+                asymmetric_exit=asym, vol_regime_filter=vrf,
+                vol_regime_multiple=vrm,
+            )
+            if _params_to_key(params_obj) in already_done:
+                skipped += 1
+                continue
+
         params_dict = dict(
             lookback_bars=lb, z_entry=ze, z_exit=zx, confirm_bars=cb,
             stop_multiple=sm, momentum_threshold=mt,
@@ -384,44 +487,44 @@ def main() -> None:
             args.capital, args.max_contracts,
         ))
 
-    csv_path = args.output
-    init_csv(csv_path)
-    completed_count = 0
+    remaining_total = len(worker_args)
+    if skipped > 0:
+        print(f"  RESUME: Skipping {skipped:,} already-completed, running {remaining_total:,} remaining")
+        est_remaining_hours = remaining_total * est_seconds_per_run / num_workers / 3600
+        print(f"  Revised estimate: ~{est_remaining_hours:.1f} hours")
+        print()
+
+    init_csv(csv_path, resume=args.resume)
+    completed_count = len(already_done) if args.resume else 0
     error_count = 0
     start_time = time.time()
 
-    if num_workers == 1:
+    if remaining_total == 0:
+        print("  All combinations already completed! Nothing to do.")
+        print(f"  Results at: {csv_path}")
+    elif num_workers == 1:
         # Sequential mode
         registry = ContractRegistry()
-        for i, combo in enumerate(combos, 1):
-            (lb, ze, zx, cb, sm, mt, mh, sf,
-             zsp, vs, pl, tw,
-             zw, lsa, asym, vrf, vrm) = combo
-            params = V3ParamSet(
-                lookback_bars=lb, z_entry=ze, z_exit=zx, confirm_bars=cb,
-                stop_multiple=sm, momentum_threshold=mt,
-                min_hold_bars=mh, skip_first_minutes=sf,
-                z_spread_threshold=zsp, volume_spike_multiple=vs,
-                per_leg_exit=pl, time_weight_enabled=tw,
-                require_z_widening=zw, leg_stop_atr_multiple=lsa,
-                asymmetric_exit=asym, vol_regime_filter=vrf,
-                vol_regime_multiple=vrm,
-            )
+        for i, wa in enumerate(worker_args, 1):
+            _, _, params_dict, cap, maxc = wa
+            params = V3ParamSet(**params_dict)
+            p = params
             elapsed = time.time() - start_time
             avg_per = elapsed / max(1, i - 1)
-            remaining = avg_per * (total - i + 1)
+            eta = avg_per * (remaining_total - i + 1)
             print(
-                f"[{i:,}/{total:,}] lb={lb} ze={ze} zx={zx} cf={cb} "
-                f"st={sm} mom={mt} | sp={zsp} vs={vs} leg={pl} tw={tw} "
-                f"| widen={zw} latr={lsa} asym={asym} vr={vrf}  "
-                f"(~{remaining/60:.0f}m left)",
+                f"[{i:,}/{remaining_total:,}] lb={p.lookback_bars} ze={p.z_entry} "
+                f"st={p.stop_multiple} sp={p.z_spread_threshold} "
+                f"vs={p.volume_spike_multiple} leg={p.per_leg_exit} "
+                f"widen={p.require_z_widening} asym={p.asymmetric_exit} "
+                f"vr={p.vol_regime_filter}  (~{eta/60:.0f}m left)",
                 end="", flush=True,
             )
             try:
                 sr = run_single(
                     dbn_source=args.dbn_file, instruments=instruments,
-                    params=params, capital=args.capital,
-                    max_contracts=args.max_contracts, registry=registry,
+                    params=params, capital=cap,
+                    max_contracts=maxc, registry=registry,
                 )
                 append_result_csv(csv_path, sr)
                 completed_count += 1
@@ -433,36 +536,36 @@ def main() -> None:
     else:
         # Parallel mode
         completed = 0
-        print(f"Launching {total:,} backtests across {num_workers} workers...\n")
+        print(f"Launching {remaining_total:,} backtests across {num_workers} workers...\n")
 
         with mp.Pool(processes=num_workers) as pool:
             for result in pool.imap_unordered(_worker, worker_args):
                 completed += 1
                 elapsed = time.time() - start_time
                 avg_per = elapsed / completed
-                remaining = avg_per * (total - completed)
+                eta = avg_per * (remaining_total - completed)
 
                 if isinstance(result, str):
                     error_count += 1
                     if completed % 100 == 0 or completed <= 10:
-                        print(f"  [{completed:,}/{total:,}] {result}  (~{remaining/60:.0f}m left)")
+                        print(f"  [{completed:,}/{remaining_total:,}] {result}  (~{eta/60:.0f}m left)")
                 else:
                     append_result_csv(csv_path, result)
                     completed_count += 1
                     p = result.params
                     pf = f"{result.profit_factor:.2f}" if result.profit_factor < 100 else "inf"
 
-                    # Print every 100th result, or first 10, or notable results
+                    # Print every 200th, first 10, or notable results
                     if completed <= 10 or completed % 200 == 0 or result.profit_factor > 1.3:
                         print(
-                            f"  [{completed:,}/{total:,}] "
+                            f"  [{completed:,}/{remaining_total:,}] "
                             f"lb={p.lookback_bars} ze={p.z_entry} st={p.stop_multiple} "
                             f"sp={p.z_spread_threshold} vs={p.volume_spike_multiple} "
                             f"leg={p.per_leg_exit} widen={p.require_z_widening} "
                             f"asym={p.asymmetric_exit} vr={p.vol_regime_filter}  "
                             f"-> PF={pf} WR={result.win_rate*100:.1f}% "
                             f"PnL=${result.net_pnl:,.0f} T={result.total_trades}  "
-                            f"(~{remaining/60:.0f}m left)"
+                            f"(~{eta/60:.0f}m left)"
                         )
 
     total_time = time.time() - start_time
