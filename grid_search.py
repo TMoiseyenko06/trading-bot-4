@@ -183,20 +183,82 @@ def print_results_table(results: list[SearchResult]) -> None:
     print(sep)
 
 
+CSV_COLUMNS = [
+    "lookback_bars", "z_entry", "z_exit", "confirm_bars",
+    "stop_multiple", "momentum_threshold",
+    "min_hold_bars", "skip_first_minutes",
+    "profit_factor", "win_rate", "sharpe", "sortino", "calmar",
+    "net_pnl", "max_dd_pct", "max_dd_dollars", "total_trades",
+    "avg_winner", "avg_loser", "expectancy", "avg_hold_bars",
+    "best_day", "worst_day",
+]
+
+
+def init_csv(path: str) -> None:
+    """Write CSV header (overwrites existing file)."""
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        csv.writer(f).writerow(CSV_COLUMNS)
+
+
+def append_result_csv(path: str, r: SearchResult) -> None:
+    """Append a single result row to CSV — crash-safe, no memory needed."""
+    p = r.params
+    with open(path, "a", newline="") as f:
+        csv.writer(f).writerow([
+            p.lookback_bars, p.z_entry, p.z_exit, p.confirm_bars,
+            p.stop_multiple, p.momentum_threshold,
+            p.min_hold_bars, p.skip_first_minutes,
+            r.profit_factor, r.win_rate, r.sharpe, r.sortino, r.calmar,
+            r.net_pnl, r.max_dd_pct, r.max_dd_dollars, r.total_trades,
+            r.avg_winner, r.avg_loser, r.expectancy, r.avg_hold_bars,
+            r.best_day, r.worst_day,
+        ])
+
+
+def load_results_csv(path: str) -> list[SearchResult]:
+    """Load results from CSV back into SearchResult objects for the summary table."""
+    results = []
+    with open(path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            params = ParamSet(
+                lookback_bars=int(row["lookback_bars"]),
+                z_entry=float(row["z_entry"]),
+                z_exit=float(row["z_exit"]),
+                confirm_bars=int(row["confirm_bars"]),
+                stop_multiple=float(row["stop_multiple"]),
+                momentum_threshold=float(row["momentum_threshold"]),
+                min_hold_bars=int(row["min_hold_bars"]),
+                skip_first_minutes=int(row["skip_first_minutes"]),
+            )
+            results.append(SearchResult(
+                params=params,
+                net_pnl=float(row["net_pnl"]),
+                profit_factor=float(row["profit_factor"]),
+                win_rate=float(row["win_rate"]),
+                sharpe=float(row["sharpe"]),
+                sortino=float(row["sortino"]),
+                calmar=float(row["calmar"]),
+                max_dd_pct=float(row["max_dd_pct"]),
+                max_dd_dollars=float(row["max_dd_dollars"]),
+                total_trades=int(row["total_trades"]),
+                avg_winner=float(row["avg_winner"]),
+                avg_loser=float(row["avg_loser"]),
+                expectancy=float(row["expectancy"]),
+                best_day=float(row["best_day"]),
+                worst_day=float(row["worst_day"]),
+                avg_hold_bars=float(row["avg_hold_bars"]),
+            ))
+    return results
+
+
 def save_results_csv(results: list[SearchResult], path: str) -> None:
     """Save results to CSV for further analysis."""
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "lookback_bars", "z_entry", "z_exit", "confirm_bars",
-            "stop_multiple", "momentum_threshold",
-            "min_hold_bars", "skip_first_minutes",
-            "profit_factor", "win_rate", "sharpe", "sortino", "calmar",
-            "net_pnl", "max_dd_pct", "max_dd_dollars", "total_trades",
-            "avg_winner", "avg_loser", "expectancy", "avg_hold_bars",
-            "best_day", "worst_day",
-        ])
+        writer.writerow(CSV_COLUMNS)
         for r in results:
             p = r.params
             writer.writerow([
@@ -392,11 +454,13 @@ Examples:
             args.capital, args.max_contracts,
         ))
 
-    results: list[SearchResult] = []
+    # Initialize CSV — write header, results stream directly to disk
+    csv_path = args.output
+    init_csv(csv_path)
+    completed_count = 0
     start_time = time.time()
 
     if sequential:
-        # Sequential mode — same as before, with progress
         registry = ContractRegistry()
         for i, (lb, ze, zx, cb, sm, mt, mh, sf) in enumerate(combos, 1):
             params = ParamSet(
@@ -421,13 +485,13 @@ Examples:
                     capital=args.capital, max_contracts=args.max_contracts,
                     registry=registry,
                 )
-                results.append(sr)
+                append_result_csv(csv_path, sr)
+                completed_count += 1
                 pf = f"{sr.profit_factor:.2f}" if sr.profit_factor < 100 else "inf"
                 print(f"  -> PF={pf}, WR={sr.win_rate:.1f}%, PnL=${sr.net_pnl:,.0f}, DD={sr.max_dd_pct:.1f}%")
             except Exception as e:
                 print(f"  -> ERROR: {e}")
     else:
-        # Parallel mode — use process pool
         completed = 0
         print(f"Launching {total} backtests across {num_workers} workers...\n")
 
@@ -439,10 +503,10 @@ Examples:
                 remaining = avg_per * (total - completed)
 
                 if isinstance(result, str):
-                    # Error
                     print(f"  [{completed}/{total}] {result}  (~{remaining/60:.0f}m remaining)")
                 else:
-                    results.append(result)
+                    append_result_csv(csv_path, result)
+                    completed_count += 1
                     p = result.params
                     pf = f"{result.profit_factor:.2f}" if result.profit_factor < 100 else "inf"
                     print(
@@ -456,11 +520,12 @@ Examples:
 
     total_time = time.time() - start_time
     print(f"\nGrid search complete in {total_time/60:.1f} minutes")
+    print(f"Results saved to: {csv_path} ({completed_count} rows)")
 
-    # Print and save results
-    if results:
+    # Load from CSV and print summary table
+    if completed_count > 0:
+        results = load_results_csv(csv_path)
         print_results_table(results)
-        save_results_csv(results, args.output)
 
 
 if __name__ == "__main__":
