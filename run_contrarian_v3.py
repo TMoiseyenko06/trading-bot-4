@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """CLI entry point for V3 contrarian mean-reversion basket strategy.
 
-Uses optimal V2 base parameters with V3 improvements.
-
 Usage:
   python run_contrarian_v3.py data/multi.dbn --instruments NQ ES RTY YM
 """
@@ -41,13 +39,26 @@ def main() -> None:
 
     # V3 params
     parser.add_argument("--z-spread", type=float, default=2.0)
-    parser.add_argument("--exit-tighten-bars", type=int, default=20)
-    parser.add_argument("--exit-tighten-rate", type=float, default=0.02)
     parser.add_argument("--volume-spike", type=float, default=1.3)
     parser.add_argument("--per-leg-exit", action="store_true", default=True)
     parser.add_argument("--no-per-leg-exit", dest="per_leg_exit", action="store_false")
     parser.add_argument("--time-weight", action="store_true", default=False)
     parser.add_argument("--no-time-weight", dest="time_weight", action="store_false")
+
+    # V3.1 win rate params
+    parser.add_argument("--z-widening", action="store_true", default=False,
+                        help="Require z-score to be widening at entry")
+    parser.add_argument("--no-z-widening", dest="z_widening", action="store_false")
+    parser.add_argument("--leg-stop-atr", type=float, default=3.0,
+                        help="Per-leg ATR stop multiple (default: 3.0)")
+    parser.add_argument("--asymmetric-exit", action="store_true", default=False,
+                        help="Winners ride to full reversion, losers cut fast")
+    parser.add_argument("--no-asymmetric-exit", dest="asymmetric_exit", action="store_false")
+    parser.add_argument("--vol-regime", action="store_true", default=False,
+                        help="Skip entries when intraday vol is elevated")
+    parser.add_argument("--no-vol-regime", dest="vol_regime", action="store_false")
+    parser.add_argument("--vol-regime-mult", type=float, default=1.5,
+                        help="Vol regime threshold multiple (default: 1.5)")
 
     # Engine params
     parser.add_argument("--capital", type=float, default=100_000.0)
@@ -76,10 +87,15 @@ def main() -> None:
     print("  Base params:")
     print(f"    lookback={args.lookback}, z_entry={args.z_entry}, z_exit={args.z_exit}")
     print(f"    confirm={args.confirm_bars}, stop={args.stop_multiple}, momentum={args.momentum_threshold}")
+    print(f"    min_hold={args.min_hold_bars}, skip_first={args.skip_first_minutes}")
     print()
     print("  V3 params:")
-    print(f"    z_spread={args.z_spread}, exit_tighten={args.exit_tighten_bars}/{args.exit_tighten_rate}")
-    print(f"    volume_spike={args.volume_spike}, per_leg={args.per_leg_exit}, time_weight={args.time_weight}")
+    print(f"    z_spread={args.z_spread}, volume_spike={args.volume_spike}")
+    print(f"    per_leg={args.per_leg_exit}, time_weight={args.time_weight}")
+    print()
+    print("  V3.1 win rate params:")
+    print(f"    z_widening={args.z_widening}, leg_stop_atr={args.leg_stop_atr}")
+    print(f"    asymmetric={args.asymmetric_exit}, vol_regime={args.vol_regime}/{args.vol_regime_mult}")
     print("=" * 60)
     print()
 
@@ -93,11 +109,14 @@ def main() -> None:
         min_hold_bars=args.min_hold_bars,
         skip_first_minutes=args.skip_first_minutes,
         z_spread_threshold=args.z_spread,
-        exit_tighten_bars=args.exit_tighten_bars,
-        exit_tighten_rate=args.exit_tighten_rate,
         volume_spike_multiple=args.volume_spike,
         per_leg_exit=args.per_leg_exit,
         time_weight_enabled=args.time_weight,
+        require_z_widening=args.z_widening,
+        leg_stop_atr_multiple=args.leg_stop_atr,
+        asymmetric_exit=args.asymmetric_exit,
+        vol_regime_filter=args.vol_regime,
+        vol_regime_multiple=args.vol_regime_mult,
     )
 
     config = EngineConfig(

@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Grid search over V3 contrarian mean-reversion strategy parameters.
+"""Comprehensive grid search over ALL V3 strategy parameters.
 
-Focuses on the new V3 parameters while using optimal V2 base parameters
-discovered from the 864-combination grid search:
-  - lookback=60, z_entry=2.0, z_exit=0.5, confirm=2
-  - stop=4.0, momentum=0.75, min_hold=3, skip_first=0
+Searches across base V2 params + V3 features + V3.1 win rate improvements.
+Designed for high core count machines (80+ cores).
 
 Usage:
-  python grid_search_v3.py data/multi.dbn --instruments NQ ES RTY YM
+  python grid_search_v3.py data/multi.dbn --instruments NQ ES RTY YM --workers 80
 """
 
 from __future__ import annotations
@@ -18,7 +16,6 @@ import itertools
 import logging
 import multiprocessing as mp
 import os
-import sys
 import time
 from dataclasses import dataclass
 
@@ -31,8 +28,8 @@ from strategies.contrarian_reversion_v3 import ContraMeanReversionV3
 
 @dataclass
 class V3ParamSet:
-    """One combination of V3 strategy parameters."""
-    # Base params (from V2 optimal)
+    """One combination of all strategy parameters."""
+    # Base params
     lookback_bars: int
     z_entry: float
     z_exit: float
@@ -41,18 +38,22 @@ class V3ParamSet:
     momentum_threshold: float
     min_hold_bars: int
     skip_first_minutes: int
-    # V3 new params
+    # V3 params
     z_spread_threshold: float
-    exit_tighten_bars: int
-    exit_tighten_rate: float
     volume_spike_multiple: float
     per_leg_exit: bool
     time_weight_enabled: bool
+    # V3.1 win rate params
+    require_z_widening: bool
+    leg_stop_atr_multiple: float
+    asymmetric_exit: bool
+    vol_regime_filter: bool
+    vol_regime_multiple: float
 
 
 @dataclass
 class V3SearchResult:
-    """Results from one V3 parameter combination."""
+    """Results from one parameter combination."""
     params: V3ParamSet
     net_pnl: float
     profit_factor: float
@@ -79,7 +80,7 @@ def run_single(
     max_contracts: int,
     registry: ContractRegistry,
 ) -> V3SearchResult:
-    """Run one backtest with a specific V3 parameter set."""
+    """Run one backtest with a specific parameter set."""
     strategy = ContraMeanReversionV3(
         lookback_bars=params.lookback_bars,
         z_entry_threshold=params.z_entry,
@@ -90,11 +91,14 @@ def run_single(
         min_hold_bars=params.min_hold_bars,
         skip_first_minutes=params.skip_first_minutes,
         z_spread_threshold=params.z_spread_threshold,
-        exit_tighten_bars=params.exit_tighten_bars,
-        exit_tighten_rate=params.exit_tighten_rate,
         volume_spike_multiple=params.volume_spike_multiple,
         per_leg_exit=params.per_leg_exit,
         time_weight_enabled=params.time_weight_enabled,
+        require_z_widening=params.require_z_widening,
+        leg_stop_atr_multiple=params.leg_stop_atr_multiple,
+        asymmetric_exit=params.asymmetric_exit,
+        vol_regime_filter=params.vol_regime_filter,
+        vol_regime_multiple=params.vol_regime_multiple,
     )
 
     config = EngineConfig(
@@ -155,8 +159,10 @@ CSV_COLUMNS = [
     "lookback_bars", "z_entry", "z_exit", "confirm_bars",
     "stop_multiple", "momentum_threshold",
     "min_hold_bars", "skip_first_minutes",
-    "z_spread_threshold", "exit_tighten_bars", "exit_tighten_rate",
-    "volume_spike_multiple", "per_leg_exit", "time_weight_enabled",
+    "z_spread_threshold", "volume_spike_multiple",
+    "per_leg_exit", "time_weight_enabled",
+    "require_z_widening", "leg_stop_atr_multiple",
+    "asymmetric_exit", "vol_regime_filter", "vol_regime_multiple",
     "profit_factor", "win_rate", "sharpe", "sortino", "calmar",
     "net_pnl", "max_dd_pct", "max_dd_dollars", "total_trades",
     "avg_winner", "avg_loser", "expectancy", "avg_hold_bars",
@@ -177,8 +183,10 @@ def append_result_csv(path: str, r: V3SearchResult) -> None:
             p.lookback_bars, p.z_entry, p.z_exit, p.confirm_bars,
             p.stop_multiple, p.momentum_threshold,
             p.min_hold_bars, p.skip_first_minutes,
-            p.z_spread_threshold, p.exit_tighten_bars, p.exit_tighten_rate,
-            p.volume_spike_multiple, p.per_leg_exit, p.time_weight_enabled,
+            p.z_spread_threshold, p.volume_spike_multiple,
+            p.per_leg_exit, p.time_weight_enabled,
+            p.require_z_widening, p.leg_stop_atr_multiple,
+            p.asymmetric_exit, p.vol_regime_filter, p.vol_regime_multiple,
             r.profit_factor, r.win_rate, r.sharpe, r.sortino, r.calmar,
             r.net_pnl, r.max_dd_pct, r.max_dd_dollars, r.total_trades,
             r.avg_winner, r.avg_loser, r.expectancy, r.avg_hold_bars,
@@ -212,9 +220,13 @@ def parse_int_list(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",")]
 
 
+def parse_bool_list(s: str) -> list[bool]:
+    return [x.strip().lower() == "true" for x in s.split(",")]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="V3 Grid search — tests new features with optimal V2 base params",
+        description="Comprehensive V3 grid search — all parameters",
     )
 
     parser.add_argument("dbn_file", help="Single .dbn file with all instruments")
@@ -223,45 +235,52 @@ def main() -> None:
         help="Instrument root symbols (e.g. NQ ES RTY YM)",
     )
 
-    # Base params — use V2 optimal values, allow override
-    parser.add_argument("--lookbacks", type=str, default="60",
-                        help="Base lookback bars (default: 60)")
-    parser.add_argument("--z-entries", type=str, default="2.0",
-                        help="Base z_entry (default: 2.0)")
-    parser.add_argument("--z-exits", type=str, default="0.5",
-                        help="Base z_exit (default: 0.5)")
-    parser.add_argument("--confirm", type=str, default="2",
-                        help="Base confirm bars (default: 2)")
-    parser.add_argument("--stop-multiples", type=str, default="4.0",
-                        help="Base stop multiple (default: 4.0)")
-    parser.add_argument("--momentum-thresholds", type=str, default="0.75",
-                        help="Base momentum threshold (default: 0.75)")
-    parser.add_argument("--min-hold", type=str, default="3",
-                        help="Base min hold bars (default: 3)")
-    parser.add_argument("--skip-first", type=str, default="0",
-                        help="Base skip first minutes (default: 0)")
+    # === BASE PARAMS (full V2 ranges) ===
+    parser.add_argument("--lookbacks", type=str, default="30,60,90",
+                        help="Lookback bars (default: 30,60,90)")
+    parser.add_argument("--z-entries", type=str, default="1.5,2.0,2.5",
+                        help="Z-entry thresholds (default: 1.5,2.0,2.5)")
+    parser.add_argument("--z-exits", type=str, default="0.3,0.5",
+                        help="Z-exit thresholds (default: 0.3,0.5)")
+    parser.add_argument("--confirm", type=str, default="2,3",
+                        help="Confirmation bars (default: 2,3)")
+    parser.add_argument("--stop-multiples", type=str, default="2.0,3.0,4.0",
+                        help="Stop multiples (default: 2.0,3.0,4.0)")
+    parser.add_argument("--momentum-thresholds", type=str, default="0.65,0.75",
+                        help="Momentum thresholds (default: 0.65,0.75)")
+    parser.add_argument("--min-hold", type=str, default="3,5",
+                        help="Min hold bars (default: 3,5)")
+    parser.add_argument("--skip-first", type=str, default="0,30",
+                        help="Skip first N minutes (default: 0,30)")
 
-    # V3 new parameter ranges
-    parser.add_argument("--z-spreads", type=str, default="2.0,3.0,4.0",
-                        help="Z-score spread thresholds (default: 2.0,3.0,4.0)")
-    parser.add_argument("--exit-tighten-bars", type=str, default="15,25,40",
-                        help="Bars before exit tightening starts (default: 15,25,40)")
-    parser.add_argument("--exit-tighten-rates", type=str, default="0.01,0.02,0.04",
-                        help="Exit tighten rate per bar (default: 0.01,0.02,0.04)")
-    parser.add_argument("--volume-spikes", type=str, default="1.0,1.3,1.5",
-                        help="Volume spike multiples (1.0=disabled) (default: 1.0,1.3,1.5)")
+    # === V3 PARAMS ===
+    parser.add_argument("--z-spreads", type=str, default="2.0,3.0",
+                        help="Z-spread thresholds (default: 2.0,3.0)")
+    parser.add_argument("--volume-spikes", type=str, default="1.0,1.3",
+                        help="Volume spike multiples (default: 1.0,1.3)")
     parser.add_argument("--per-leg", type=str, default="True,False",
-                        help="Per-leg exit mode (default: True,False)")
+                        help="Per-leg exit (default: True,False)")
     parser.add_argument("--time-weight", type=str, default="True,False",
-                        help="Time-of-day weighting (default: True,False)")
+                        help="Time weighting (default: True,False)")
 
-    # Engine params
+    # === V3.1 WIN RATE PARAMS ===
+    parser.add_argument("--z-widening", type=str, default="True,False",
+                        help="Require z-score widening (default: True,False)")
+    parser.add_argument("--leg-stop-atr", type=str, default="2.0,3.0",
+                        help="Per-leg ATR stop multiple (default: 2.0,3.0)")
+    parser.add_argument("--asymmetric", type=str, default="True,False",
+                        help="Asymmetric exit (default: True,False)")
+    parser.add_argument("--vol-regime", type=str, default="True,False",
+                        help="Vol regime filter (default: True,False)")
+    parser.add_argument("--vol-regime-mult", type=str, default="1.5",
+                        help="Vol regime multiple (default: 1.5)")
+
+    # === ENGINE ===
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--max-contracts", type=int, default=20)
-    parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument(
-        "--output", type=str, default="results_grid_v3/grid_v3_results.csv",
-    )
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Parallel workers (0=auto, default: 0)")
+    parser.add_argument("--output", type=str, default="results_grid_v3/grid_v3_full_results.csv")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -271,7 +290,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    # Parse parameter ranges
+    # Parse all ranges
     lookbacks = parse_int_list(args.lookbacks)
     z_entries = parse_float_list(args.z_entries)
     z_exits = parse_float_list(args.z_exits)
@@ -282,11 +301,15 @@ def main() -> None:
     skip_firsts = parse_int_list(args.skip_first)
 
     z_spreads = parse_float_list(args.z_spreads)
-    tighten_bars = parse_int_list(args.exit_tighten_bars)
-    tighten_rates = parse_float_list(args.exit_tighten_rates)
     vol_spikes = parse_float_list(args.volume_spikes)
-    per_legs = [x.strip().lower() == "true" for x in args.per_leg.split(",")]
-    time_weights = [x.strip().lower() == "true" for x in args.time_weight.split(",")]
+    per_legs = parse_bool_list(args.per_leg)
+    time_weights = parse_bool_list(args.time_weight)
+
+    z_widenings = parse_bool_list(args.z_widening)
+    leg_stop_atrs = parse_float_list(args.leg_stop_atr)
+    asymmetrics = parse_bool_list(args.asymmetric)
+    vol_regimes = parse_bool_list(args.vol_regime)
+    vol_regime_mults = parse_float_list(args.vol_regime_mult)
 
     instruments = [s.upper() for s in args.instruments]
 
@@ -294,55 +317,67 @@ def main() -> None:
     combos = list(itertools.product(
         lookbacks, z_entries, z_exits, confirms,
         stop_mults, mom_thresholds, min_holds, skip_firsts,
-        z_spreads, tighten_bars, tighten_rates, vol_spikes,
-        per_legs, time_weights,
+        z_spreads, vol_spikes, per_legs, time_weights,
+        z_widenings, leg_stop_atrs, asymmetrics, vol_regimes, vol_regime_mults,
     ))
     total = len(combos)
 
-    print("=" * 60)
-    print("  GRID SEARCH v3 — Contrarian Mean-Reversion")
-    print("=" * 60)
+    num_workers = args.workers if args.workers > 0 else mp.cpu_count()
+    est_seconds_per_run = 10
+    est_total_seconds = total * est_seconds_per_run / num_workers
+    est_hours = est_total_seconds / 3600
+
+    print("=" * 70)
+    print("  COMPREHENSIVE GRID SEARCH V3 — All Parameters")
+    print("=" * 70)
     print(f"  Data: {args.dbn_file}")
     print(f"  Instruments: {instruments}")
     print(f"  Capital: ${args.capital:,.0f}")
     print()
-    print("  BASE PARAMS (from V2 optimal):")
-    print(f"    Lookback bars:     {lookbacks}")
-    print(f"    Z-entry:           {z_entries}")
-    print(f"    Z-exit:            {z_exits}")
-    print(f"    Confirm bars:      {confirms}")
-    print(f"    Stop multiples:    {stop_mults}")
-    print(f"    Momentum thresh:   {mom_thresholds}")
-    print(f"    Min hold bars:     {min_holds}")
-    print(f"    Skip first mins:   {skip_firsts}")
+    print("  BASE PARAMS:")
+    print(f"    Lookback:    {lookbacks}")
+    print(f"    Z-entry:     {z_entries}")
+    print(f"    Z-exit:      {z_exits}")
+    print(f"    Confirm:     {confirms}")
+    print(f"    Stop mult:   {stop_mults}")
+    print(f"    Momentum:    {mom_thresholds}")
+    print(f"    Min hold:    {min_holds}")
+    print(f"    Skip first:  {skip_firsts}")
     print()
-    print("  V3 NEW PARAMS:")
-    print(f"    Z-spread thresh:   {z_spreads}")
-    print(f"    Exit tighten bars: {list(tighten_bars)}")
-    print(f"    Exit tighten rate: {tighten_rates}")
-    print(f"    Volume spike mult: {vol_spikes}")
-    print(f"    Per-leg exit:      {per_legs}")
-    print(f"    Time weighting:    {time_weights}")
+    print("  V3 PARAMS:")
+    print(f"    Z-spread:    {z_spreads}")
+    print(f"    Vol spike:   {vol_spikes}")
+    print(f"    Per-leg:     {per_legs}")
+    print(f"    Time weight: {time_weights}")
     print()
-    print(f"  Total combinations: {total}")
-
-    num_workers = args.workers if args.workers > 0 else mp.cpu_count()
-    sequential = num_workers == 1
-
-    print(f"  Workers: {num_workers} {'(sequential)' if sequential else f'(parallel)'}")
-    print("=" * 60)
+    print("  V3.1 WIN RATE PARAMS:")
+    print(f"    Z-widening:  {z_widenings}")
+    print(f"    Leg ATR stop:{leg_stop_atrs}")
+    print(f"    Asymmetric:  {asymmetrics}")
+    print(f"    Vol regime:  {vol_regimes}")
+    print(f"    Vol reg mult:{vol_regime_mults}")
+    print()
+    print(f"  Total combinations: {total:,}")
+    print(f"  Workers: {num_workers}")
+    print(f"  Estimated time: ~{est_hours:.1f} hours ({est_total_seconds/60:.0f} min)")
+    print("=" * 70)
     print()
 
     # Build worker arguments
     worker_args = []
-    for lb, ze, zx, cb, sm, mt, mh, sf, zsp, tb, tr, vs, pl, tw in combos:
+    for combo in combos:
+        (lb, ze, zx, cb, sm, mt, mh, sf,
+         zsp, vs, pl, tw,
+         zw, lsa, asym, vrf, vrm) = combo
         params_dict = dict(
             lookback_bars=lb, z_entry=ze, z_exit=zx, confirm_bars=cb,
             stop_multiple=sm, momentum_threshold=mt,
             min_hold_bars=mh, skip_first_minutes=sf,
-            z_spread_threshold=zsp, exit_tighten_bars=tb,
-            exit_tighten_rate=tr, volume_spike_multiple=vs,
+            z_spread_threshold=zsp, volume_spike_multiple=vs,
             per_leg_exit=pl, time_weight_enabled=tw,
+            require_z_widening=zw, leg_stop_atr_multiple=lsa,
+            asymmetric_exit=asym, vol_regime_filter=vrf,
+            vol_regime_multiple=vrm,
         )
         worker_args.append((
             args.dbn_file, instruments, params_dict,
@@ -352,27 +387,34 @@ def main() -> None:
     csv_path = args.output
     init_csv(csv_path)
     completed_count = 0
+    error_count = 0
     start_time = time.time()
 
-    if sequential:
+    if num_workers == 1:
+        # Sequential mode
         registry = ContractRegistry()
         for i, combo in enumerate(combos, 1):
-            lb, ze, zx, cb, sm, mt, mh, sf, zsp, tb, tr, vs, pl, tw = combo
+            (lb, ze, zx, cb, sm, mt, mh, sf,
+             zsp, vs, pl, tw,
+             zw, lsa, asym, vrf, vrm) = combo
             params = V3ParamSet(
                 lookback_bars=lb, z_entry=ze, z_exit=zx, confirm_bars=cb,
                 stop_multiple=sm, momentum_threshold=mt,
                 min_hold_bars=mh, skip_first_minutes=sf,
-                z_spread_threshold=zsp, exit_tighten_bars=tb,
-                exit_tighten_rate=tr, volume_spike_multiple=vs,
+                z_spread_threshold=zsp, volume_spike_multiple=vs,
                 per_leg_exit=pl, time_weight_enabled=tw,
+                require_z_widening=zw, leg_stop_atr_multiple=lsa,
+                asymmetric_exit=asym, vol_regime_filter=vrf,
+                vol_regime_multiple=vrm,
             )
             elapsed = time.time() - start_time
             avg_per = elapsed / max(1, i - 1)
             remaining = avg_per * (total - i + 1)
             print(
-                f"[{i}/{total}] spread={zsp:.1f}, tighten={tb}/{tr:.3f}, "
-                f"vol={vs:.1f}, leg={pl}, time={tw}  "
-                f"(~{remaining/60:.0f}m remaining)",
+                f"[{i:,}/{total:,}] lb={lb} ze={ze} zx={zx} cf={cb} "
+                f"st={sm} mom={mt} | sp={zsp} vs={vs} leg={pl} tw={tw} "
+                f"| widen={zw} latr={lsa} asym={asym} vr={vrf}  "
+                f"(~{remaining/60:.0f}m left)",
                 end="", flush=True,
             )
             try:
@@ -384,12 +426,14 @@ def main() -> None:
                 append_result_csv(csv_path, sr)
                 completed_count += 1
                 pf = f"{sr.profit_factor:.2f}" if sr.profit_factor < 100 else "inf"
-                print(f"  -> PF={pf}, PnL=${sr.net_pnl:,.0f}, trades={sr.total_trades}")
+                print(f"  -> PF={pf} WR={sr.win_rate*100:.1f}% PnL=${sr.net_pnl:,.0f} T={sr.total_trades}")
             except Exception as e:
+                error_count += 1
                 print(f"  -> ERROR: {e}")
     else:
+        # Parallel mode
         completed = 0
-        print(f"Launching {total} backtests across {num_workers} workers...\n")
+        print(f"Launching {total:,} backtests across {num_workers} workers...\n")
 
         with mp.Pool(processes=num_workers) as pool:
             for result in pool.imap_unordered(_worker, worker_args):
@@ -399,25 +443,35 @@ def main() -> None:
                 remaining = avg_per * (total - completed)
 
                 if isinstance(result, str):
-                    print(f"  [{completed}/{total}] {result}  (~{remaining/60:.0f}m remaining)")
+                    error_count += 1
+                    if completed % 100 == 0 or completed <= 10:
+                        print(f"  [{completed:,}/{total:,}] {result}  (~{remaining/60:.0f}m left)")
                 else:
                     append_result_csv(csv_path, result)
                     completed_count += 1
                     p = result.params
                     pf = f"{result.profit_factor:.2f}" if result.profit_factor < 100 else "inf"
-                    print(
-                        f"  [{completed}/{total}] spread={p.z_spread_threshold:.1f}, "
-                        f"tighten={p.exit_tighten_bars}/{p.exit_tighten_rate:.3f}, "
-                        f"vol={p.volume_spike_multiple:.1f}, leg={p.per_leg_exit}, "
-                        f"time={p.time_weight_enabled}  "
-                        f"-> PF={pf}, PnL=${result.net_pnl:,.0f}, "
-                        f"trades={result.total_trades}  "
-                        f"(~{remaining/60:.0f}m remaining)"
-                    )
+
+                    # Print every 100th result, or first 10, or notable results
+                    if completed <= 10 or completed % 200 == 0 or result.profit_factor > 1.3:
+                        print(
+                            f"  [{completed:,}/{total:,}] "
+                            f"lb={p.lookback_bars} ze={p.z_entry} st={p.stop_multiple} "
+                            f"sp={p.z_spread_threshold} vs={p.volume_spike_multiple} "
+                            f"leg={p.per_leg_exit} widen={p.require_z_widening} "
+                            f"asym={p.asymmetric_exit} vr={p.vol_regime_filter}  "
+                            f"-> PF={pf} WR={result.win_rate*100:.1f}% "
+                            f"PnL=${result.net_pnl:,.0f} T={result.total_trades}  "
+                            f"(~{remaining/60:.0f}m left)"
+                        )
 
     total_time = time.time() - start_time
-    print(f"\nV3 grid search complete in {total_time/60:.1f} minutes")
-    print(f"Results saved to: {csv_path} ({completed_count} rows)")
+    print()
+    print("=" * 70)
+    print(f"  Grid search complete in {total_time/3600:.1f} hours ({total_time/60:.0f} min)")
+    print(f"  Results saved: {csv_path}")
+    print(f"  Completed: {completed_count:,} / {total:,} ({error_count} errors)")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

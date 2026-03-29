@@ -1,18 +1,15 @@
 """Intraday contrarian mean-reversion basket strategy (v3).
 
-Improvements over v2 based on grid search analysis of 864 parameter combinations:
-1. Spread-based signal: require cross-sectional z-score spread (max - min) threshold
+Improvements over v2 based on grid search analysis:
+1. Spread-based signal: require cross-sectional z-score spread threshold
 2. Adaptive exit tightening: progressively tighten exit threshold as trade ages
-3. Relative volume filter: rolling average volume spike detection instead of bar-to-bar
-4. Per-leg profit taking: exit individual legs when they revert, not all-or-nothing
+3. Relative volume filter: rolling average volume spike detection
+4. Per-leg profit taking: exit individual legs when they revert
 5. Intraday time weighting: scale entry threshold by time-of-day
-
-Key findings from grid search:
-- z_entry=2.0 sweet spot (1.5 loses, 2.5 too rare)
-- stop_multiple=4.0 >> 3.0 >> 2.0 (trades need room)
-- momentum=0.75 >> 0.65 (stricter trending filter)
-- z_exit=0.5 >> 0.3 (exit sooner captures more profit)
-- lookback=60 highest Sharpe, lookback=30 most trades
+6. Z-score widening: require divergence to still be accelerating at entry
+7. Per-leg ATR stop: tighter ATR-based stop on individual legs
+8. Asymmetric exit: let winners ride to full reversion, cut losers fast
+9. Volatility regime filter: skip entries when intraday vol is elevated
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional
 
 from engine.execution import Fill, Order, OrderSide, OrderType, TimeInForce
@@ -49,6 +45,7 @@ class _InstrumentData:
     # Rolling statistics
     deviation: float = 0.0
     z_score: float = 0.0
+    prev_z_score: float = 0.0  # for z-widening check
     rolling_vol: float = 0.0
     raw_weight: float = 0.0
     normalized_weight: float = 0.0
@@ -61,13 +58,13 @@ class _InstrumentData:
     entry_deviation: float = 0.0
     entry_z_score: float = 0.0
     entry_price: float = 0.0
-    entry_weight: float = 0.0  # v3: track entry weight for per-leg exits
+    entry_weight: float = 0.0
 
     # ATR for stop loss
     atr_value: Optional[float] = None
     atr_prev_close: Optional[float] = None
 
-    # v3: track if this leg has been exited
+    # Per-leg tracking
     leg_exited: bool = False
 
     def reset_session(self) -> None:
@@ -81,6 +78,7 @@ class _InstrumentData:
         self.prev_close = 0.0
         self.deviation = 0.0
         self.z_score = 0.0
+        self.prev_z_score = 0.0
         self.rolling_vol = 0.0
         self.raw_weight = 0.0
         self.normalized_weight = 0.0
@@ -112,15 +110,7 @@ class _InstrumentData:
 
 
 class ContraMeanReversionV3(MultiInstrumentStrategy):
-    """Intraday contrarian mean-reversion across US equity index futures (v3).
-
-    Key improvements over v2:
-    - Spread-based entry signal (cross-sectional z-score spread)
-    - Adaptive exit tightening as trade ages
-    - Rolling volume spike filter
-    - Per-leg profit taking
-    - Intraday time-of-day weighting
-    """
+    """Intraday contrarian mean-reversion across US equity index futures (v3)."""
 
     def __init__(
         self,
@@ -137,15 +127,21 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         confirm_bars: int = 2,
         momentum_filter_window: int = 20,
         momentum_threshold: float = 0.75,
-        # v3 new parameters (defaults = best grid search results)
-        z_spread_threshold: float = 2.0,  # min spread between max and min z-scores
-        exit_tighten_bars: int = 20,  # bars after which exit starts tightening
-        exit_tighten_rate: float = 0.02,  # z_exit tightens by this per bar after tighten_bars
-        volume_spike_multiple: float = 1.3,  # require volume > N * rolling avg
-        volume_avg_window: int = 20,  # bars for rolling avg volume
-        per_leg_exit: bool = True,  # exit individual legs independently
-        time_weight_enabled: bool = False,  # scale entry by time of day
-        time_weight_peak_hour: float = 2.0,  # hours after open for peak signal weight
+        # v3 parameters
+        z_spread_threshold: float = 2.0,
+        exit_tighten_bars: int = 20,
+        exit_tighten_rate: float = 0.02,
+        volume_spike_multiple: float = 1.3,
+        volume_avg_window: int = 20,
+        per_leg_exit: bool = True,
+        time_weight_enabled: bool = False,
+        time_weight_peak_hour: float = 2.0,
+        # v3.1 — win rate improvements
+        require_z_widening: bool = False,
+        leg_stop_atr_multiple: float = 3.0,
+        asymmetric_exit: bool = False,
+        vol_regime_filter: bool = False,
+        vol_regime_multiple: float = 1.5,
     ) -> None:
         super().__init__(name)
         self._window_minutes = signal_window_minutes
@@ -171,6 +167,13 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._time_weight_enabled = time_weight_enabled
         self._time_weight_peak_hour = time_weight_peak_hour
 
+        # v3.1 win rate parameters
+        self._require_z_widening = require_z_widening
+        self._leg_stop_atr = leg_stop_atr_multiple
+        self._asymmetric_exit = asymmetric_exit
+        self._vol_regime_filter = vol_regime_filter
+        self._vol_regime_multiple = vol_regime_multiple
+
         # Runtime state
         self._symbols: list[str] = []
         self._data: dict[str, _InstrumentData] = {}
@@ -180,10 +183,13 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._past_cutoff: bool = False
         self._session_bars: int = 0
         self._skip_first_bars: int = 0
-        self._active_legs: int = 0  # v3: count of active legs
+        self._active_legs: int = 0
 
         # Rolling market return history for momentum filter
         self._market_return_history: deque = deque(maxlen=200)
+
+        # Rolling market volatility history for vol regime filter
+        self._market_vol_history: deque = deque(maxlen=200)
 
         # Display state
         self._display: dict = {}
@@ -194,18 +200,21 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             self._data[sym] = _InstrumentData()
 
         logger.info(
-            "ContraMeanRev v3: instruments=%s, lookback=%d bars, "
-            "z_entry=%.1f, z_exit=%.1f, z_spread=%.1f, confirm=%d bars, "
-            "stop=%.1fx, momentum_thresh=%.2f, "
-            "skip_first=%dm, min_hold=%d bars, "
-            "exit_tighten=%d bars @%.3f/bar, vol_spike=%.1fx, per_leg=%s",
+            "ContraMeanRev v3: instruments=%s, lookback=%d, "
+            "z_entry=%.1f, z_exit=%.1f, z_spread=%.1f, confirm=%d, "
+            "stop=%.1fx, momentum=%.2f, skip=%dm, hold=%d, "
+            "vol_spike=%.1f, per_leg=%s, time_wt=%s, "
+            "z_widen=%s, leg_atr=%.1f, asym=%s, vol_regime=%s/%.1f",
             self._symbols, self._lookback_bars,
             self._z_entry, self._z_exit, self._z_spread_threshold,
             self._confirm_bars,
             self._stop_multiple, self._momentum_threshold,
             self._skip_first_minutes, self._min_hold_bars,
-            self._exit_tighten_bars, self._exit_tighten_rate,
             self._volume_spike_mult, self._per_leg_exit,
+            self._time_weight_enabled,
+            self._require_z_widening, self._leg_stop_atr,
+            self._asymmetric_exit, self._vol_regime_filter,
+            self._vol_regime_multiple,
         )
 
     def on_bar(
@@ -248,6 +257,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._compute_deviations(state)
         self._compute_z_scores()
         self._compute_weights()
+        self._update_market_vol()
 
         # Session cutoff
         if session.minutes_to_session_close <= self._cutoff_minutes:
@@ -320,6 +330,9 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             data = self._data[sym]
             devs = data.deviation_history
 
+            # Save previous z-score before computing new one
+            data.prev_z_score = data.z_score
+
             if len(devs) < lb:
                 data.z_score = 0.0
                 data.rolling_vol = 0.0
@@ -358,13 +371,20 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             for sym in self._symbols:
                 self._data[sym].normalized_weight = 0.0
 
+    def _update_market_vol(self) -> None:
+        """Compute rolling market return volatility for vol regime filter."""
+        if len(self._market_return_history) < 20:
+            return
+        recent = list(self._market_return_history)[-20:]
+        mean_r = sum(recent) / 20
+        var_r = sum((x - mean_r) ** 2 for x in recent) / 20
+        self._market_vol_history.append(math.sqrt(var_r) if var_r > 0 else 0.0)
+
     # ------------------------------------------------------------------ #
-    # Entry logic (v3 improvements)
+    # Entry logic
     # ------------------------------------------------------------------ #
 
     def _check_entry_signal(self, state: MultiInstrumentState) -> bool:
-        """Check entry conditions with v3 spread-based signal and volume spike."""
-
         z_scores = {s: self._data[s].z_score for s in self._symbols}
 
         # 1. Z-score threshold: at least one instrument must exceed z_entry
@@ -373,7 +393,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             self._reset_confirmations()
             return False
 
-        # 2. v3: Spread-based signal — require sufficient cross-sectional spread
+        # 2. Spread-based signal
         z_max = max(z_scores.values())
         z_min = min(z_scores.values())
         z_spread = z_max - z_min
@@ -386,7 +406,21 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             self._reset_confirmations()
             return False
 
-        # 4. Confirmation bars
+        # 4. Volatility regime filter — skip when intraday vol is elevated
+        if self._vol_regime_filter and self._is_high_vol_regime():
+            self._reset_confirmations()
+            return False
+
+        # 5. Z-score widening — require divergence to be accelerating
+        if self._require_z_widening:
+            strongest_sym = max(self._symbols, key=lambda s: abs(self._data[s].z_score))
+            d = self._data[strongest_sym]
+            if abs(d.z_score) <= abs(d.prev_z_score):
+                # Divergence is contracting, not widening — skip
+                self._reset_confirmations()
+                return False
+
+        # 6. Confirmation bars
         strongest_sym = max(self._symbols, key=lambda s: abs(self._data[s].z_score))
 
         for sym in self._symbols:
@@ -402,28 +436,26 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         if self._data[strongest_sym].confirm_count < self._confirm_bars:
             return False
 
-        # 5. v3: Volume spike filter — require volume above rolling average
+        # 7. Volume spike filter
         if not self._check_volume_spike(strongest_sym):
             return False
 
-        # 6. v3: Time-of-day weighting — scale effective threshold
+        # 8. Time-of-day weighting
         if self._time_weight_enabled:
             time_scale = self._get_time_weight()
-            effective_z_entry = self._z_entry / time_scale  # lower threshold at peak hours
+            effective_z_entry = self._z_entry / time_scale
             if max_abs_z < effective_z_entry:
                 return False
 
         return True
 
     def _check_volume_spike(self, sym: str) -> bool:
-        """v3: Check if current volume is above rolling average * spike multiple."""
         data = self._data[sym]
         vols = data.volume_history
 
         if len(vols) < self._volume_avg_window + 1:
-            return True  # not enough history, allow entry
+            return True
 
-        # Rolling average of volume over window (excluding current bar)
         recent_vols = list(vols)[-(self._volume_avg_window + 1):-1]
         avg_vol = sum(recent_vols) / len(recent_vols)
 
@@ -434,25 +466,13 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         return current_vol >= avg_vol * self._volume_spike_mult
 
     def _get_time_weight(self) -> float:
-        """v3: Return a time-of-day weight for entry signal scaling.
-
-        Peak weight (1.2) at peak_hour after session open.
-        Lower weight (0.8) at session extremes (open/close).
-        This means the effective z_entry threshold is *lower* during peak hours
-        (making it easier to enter) and *higher* at session edges.
-        """
-        # Approximate hours into session based on session_bars (1-min bars)
         hours_in = self._session_bars / 60.0
-
-        # Gaussian-like weighting centered on peak_hour
         peak = self._time_weight_peak_hour
-        sigma = 1.5  # spread in hours
+        sigma = 1.5
         weight = 0.8 + 0.4 * math.exp(-0.5 * ((hours_in - peak) / sigma) ** 2)
-
         return weight
 
     def _is_trending(self) -> bool:
-        """Check if market is in a momentum regime."""
         if len(self._market_return_history) < self._momentum_window:
             return False
 
@@ -463,7 +483,6 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         if fraction > self._momentum_threshold or fraction < (1 - self._momentum_threshold):
             return True
 
-        # Check per-instrument trending
         n = len(self._symbols)
         same_dir = 0
         for sym in self._symbols:
@@ -478,6 +497,24 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             return True
 
         return False
+
+    def _is_high_vol_regime(self) -> bool:
+        """Check if current market vol is elevated vs recent history."""
+        if len(self._market_vol_history) < 30:
+            return False
+
+        current_vol = self._market_vol_history[-1]
+        if current_vol <= 0:
+            return False
+
+        # Compare current vol to median of recent vol history
+        sorted_vols = sorted(self._market_vol_history)
+        median_vol = sorted_vols[len(sorted_vols) // 2]
+
+        if median_vol <= 0:
+            return False
+
+        return current_vol > self._vol_regime_multiple * median_vol
 
     def _reset_confirmations(self) -> None:
         for sym in self._symbols:
@@ -540,7 +577,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             self._active_legs = entered
 
     # ------------------------------------------------------------------ #
-    # Exit logic (v3 improvements)
+    # Exit logic
     # ------------------------------------------------------------------ #
 
     def _check_exits(
@@ -553,43 +590,19 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         if self._min_hold_bars > 0 and bars_held < self._min_hold_bars:
             return
 
-        # v3: Adaptive exit threshold — tightens as trade ages
+        # Adaptive exit threshold — tightens as trade ages
         effective_z_exit = self._z_exit
         if bars_held > self._exit_tighten_bars:
             extra_bars = bars_held - self._exit_tighten_bars
             effective_z_exit = self._z_exit + extra_bars * self._exit_tighten_rate
-            # Cap at z_entry to avoid exiting at wider-than-entry levels
             effective_z_exit = min(effective_z_exit, self._z_entry * 0.8)
 
-        # v3: Per-leg profit taking
+        # Per-leg exit mode
         if self._per_leg_exit:
-            for sym in self._symbols:
-                inst = state.instruments[sym]
-                data = self._data[sym]
-
-                if inst.position_quantity == 0 or data.leg_exited:
-                    continue
-
-                # Check if this individual leg has reverted
-                if abs(data.z_score) < effective_z_exit:
-                    self._exit_leg(state, submit_order, sym, reason="LEG_REVERT")
-                    continue
-
-                # Stop loss check per leg
-                if self._check_leg_stop(data, inst):
-                    self._exit_leg(state, submit_order, sym, reason="LEG_STOP")
-
-            # Check if all legs are closed
-            any_open = any(
-                state.instruments[s].position_quantity > 0
-                for s in self._symbols
-            )
-            if not any_open:
-                self._in_trade = False
-                self._reset_confirmations()
+            self._check_per_leg_exits(state, submit_order, effective_z_exit)
             return
 
-        # Non per-leg mode: original all-or-nothing exit
+        # All-or-nothing exit mode
         all_reverted = all(
             abs(self._data[s].z_score) < effective_z_exit
             for s in self._symbols
@@ -610,10 +623,6 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             if abs(data.entry_z_score) > 0:
                 z_ratio = abs(data.z_score) / abs(data.entry_z_score)
                 if z_ratio > self._stop_multiple and abs(data.z_score) > self._z_entry:
-                    logger.warning(
-                        "  [%s] Z-SCORE STOP on %s: z=%.2f (entry=%.2f, ratio=%.1fx)",
-                        self.name, sym, data.z_score, data.entry_z_score, z_ratio,
-                    )
                     self._exit_all(state, submit_order, reason="STOP_LOSS")
                     return
 
@@ -624,22 +633,78 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
                     self._exit_all(state, submit_order, reason="ATR_STOP")
                     return
 
-    def _check_leg_stop(self, data: _InstrumentData, inst) -> bool:
-        """Check stop conditions for a single leg."""
-        # Z-score stop
-        if abs(data.entry_z_score) > 0:
-            z_ratio = abs(data.z_score) / abs(data.entry_z_score)
-            if z_ratio > self._stop_multiple and abs(data.z_score) > self._z_entry:
-                return True
+    def _check_per_leg_exits(
+        self,
+        state: MultiInstrumentState,
+        submit_order: MultiSubmitFn,
+        effective_z_exit: float,
+    ) -> None:
+        """Per-leg exit with optional asymmetric handling."""
+        for sym in self._symbols:
+            inst = state.instruments[sym]
+            data = self._data[sym]
 
-        # ATR stop
-        if data.atr_value and data.atr_value > 0:
+            if inst.position_quantity == 0 or data.leg_exited:
+                continue
+
             bar = inst.bar
-            price_move = abs(bar.close - data.entry_price)
-            if price_move > self._stop_multiple * data.atr_value:
-                return True
 
-        return False
+            # Determine if this leg is currently winning or losing
+            if inst.position_direction == 1:  # long
+                leg_pnl_sign = bar.close - data.entry_price
+            else:  # short
+                leg_pnl_sign = data.entry_price - bar.close
+
+            if self._asymmetric_exit:
+                # --- Asymmetric exit logic ---
+                if leg_pnl_sign > 0:
+                    # WINNING leg: let it ride to full reversion (z near 0)
+                    # Only exit when z-score crosses through zero (full mean reversion)
+                    if abs(data.z_score) < 0.1:
+                        self._exit_leg(state, submit_order, sym, reason="WINNER_FULL_REVERT")
+                        continue
+                else:
+                    # LOSING leg: cut fast with tighter ATR stop
+                    if data.atr_value and data.atr_value > 0:
+                        price_move = abs(bar.close - data.entry_price)
+                        if price_move > self._leg_stop_atr * data.atr_value:
+                            self._exit_leg(state, submit_order, sym, reason="LOSER_ATR_CUT")
+                            continue
+                    # Also check z-score stop for losers (tighter: use z_exit not stop_multiple)
+                    if abs(data.entry_z_score) > 0:
+                        z_ratio = abs(data.z_score) / abs(data.entry_z_score)
+                        if z_ratio > self._stop_multiple and abs(data.z_score) > self._z_entry:
+                            self._exit_leg(state, submit_order, sym, reason="LOSER_Z_STOP")
+                            continue
+            else:
+                # --- Standard per-leg exit ---
+                # Target: z-score reverted
+                if abs(data.z_score) < effective_z_exit:
+                    self._exit_leg(state, submit_order, sym, reason="LEG_REVERT")
+                    continue
+
+                # Per-leg ATR stop
+                if data.atr_value and data.atr_value > 0:
+                    price_move = abs(bar.close - data.entry_price)
+                    if price_move > self._leg_stop_atr * data.atr_value:
+                        self._exit_leg(state, submit_order, sym, reason="LEG_ATR_STOP")
+                        continue
+
+                # Z-score stop
+                if abs(data.entry_z_score) > 0:
+                    z_ratio = abs(data.z_score) / abs(data.entry_z_score)
+                    if z_ratio > self._stop_multiple and abs(data.z_score) > self._z_entry:
+                        self._exit_leg(state, submit_order, sym, reason="LEG_Z_STOP")
+                        continue
+
+        # Check if all legs are closed
+        any_open = any(
+            state.instruments[s].position_quantity > 0
+            for s in self._symbols
+        )
+        if not any_open:
+            self._in_trade = False
+            self._reset_confirmations()
 
     def _exit_leg(
         self,
@@ -648,7 +713,6 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         sym: str,
         reason: str,
     ) -> None:
-        """v3: Exit a single instrument leg."""
         inst = state.instruments[sym]
         if inst.position_quantity == 0:
             return
@@ -665,7 +729,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             self._data[sym].leg_exited = True
             self._active_legs -= 1
             logger.info(
-                "  [%s] EXIT LEG %s: %s %d contracts [%s] z=%.2f (remaining legs: %d)",
+                "  [%s] EXIT LEG %s: %s %d contracts [%s] z=%.2f (remaining: %d)",
                 self.name, sym, side.value, inst.position_quantity,
                 reason, self._data[sym].z_score, self._active_legs,
             )
@@ -718,6 +782,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._skip_first_bars = 0
         self._active_legs = 0
         self._market_return_history.clear()
+        self._market_vol_history.clear()
 
         logger.info("[%s] Session open — state reset", self.name)
 
