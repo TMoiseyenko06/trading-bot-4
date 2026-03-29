@@ -137,14 +137,14 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         confirm_bars: int = 2,
         momentum_filter_window: int = 20,
         momentum_threshold: float = 0.75,
-        # v3 new parameters
-        z_spread_threshold: float = 3.0,  # min spread between max and min z-scores
+        # v3 new parameters (defaults = best grid search results)
+        z_spread_threshold: float = 2.0,  # min spread between max and min z-scores
         exit_tighten_bars: int = 20,  # bars after which exit starts tightening
         exit_tighten_rate: float = 0.02,  # z_exit tightens by this per bar after tighten_bars
         volume_spike_multiple: float = 1.3,  # require volume > N * rolling avg
         volume_avg_window: int = 20,  # bars for rolling avg volume
         per_leg_exit: bool = True,  # exit individual legs independently
-        time_weight_enabled: bool = True,  # scale entry by time of day
+        time_weight_enabled: bool = False,  # scale entry by time of day
         time_weight_peak_hour: float = 2.0,  # hours after open for peak signal weight
     ) -> None:
         super().__init__(name)

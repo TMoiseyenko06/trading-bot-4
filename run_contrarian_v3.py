@@ -40,13 +40,13 @@ def main() -> None:
     parser.add_argument("--skip-first-minutes", type=int, default=0)
 
     # V3 params
-    parser.add_argument("--z-spread", type=float, default=3.0)
+    parser.add_argument("--z-spread", type=float, default=2.0)
     parser.add_argument("--exit-tighten-bars", type=int, default=20)
     parser.add_argument("--exit-tighten-rate", type=float, default=0.02)
     parser.add_argument("--volume-spike", type=float, default=1.3)
     parser.add_argument("--per-leg-exit", action="store_true", default=True)
     parser.add_argument("--no-per-leg-exit", dest="per_leg_exit", action="store_false")
-    parser.add_argument("--time-weight", action="store_true", default=True)
+    parser.add_argument("--time-weight", action="store_true", default=False)
     parser.add_argument("--no-time-weight", dest="time_weight", action="store_false")
 
     # Engine params
