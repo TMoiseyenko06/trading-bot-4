@@ -25,8 +25,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # while still being faster than "spawn" (only forks once to create the server)
 try:
     mp.set_start_method("forkserver")
-except RuntimeError:
-    pass  # already set
+except (RuntimeError, ValueError):
+    pass  # already set, or not available (Windows)
 import logging
 import time
 from dataclasses import dataclass

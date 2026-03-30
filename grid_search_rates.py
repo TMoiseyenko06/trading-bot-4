@@ -23,8 +23,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 try:
     mp.set_start_method("forkserver")
-except RuntimeError:
-    pass
+except (RuntimeError, ValueError):
+    pass  # already set, or not available (Windows)
 
 import logging
 import time
