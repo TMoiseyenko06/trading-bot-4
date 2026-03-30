@@ -538,7 +538,11 @@ def main() -> None:
         completed = 0
         print(f"Launching {remaining_total:,} backtests across {num_workers} workers...\n")
 
-        with mp.Pool(processes=num_workers) as pool:
+        # maxtasksperchild: recycle workers after N tasks to prevent RAM buildup.
+        # Each worker loads the .dbn file + builds data structures that Python
+        # won't free back to OS. Without recycling, 80 workers * ~11 tasks each
+        # = ~900 tasks before OOM. Recycling adds ~1s overhead per restart.
+        with mp.Pool(processes=num_workers, maxtasksperchild=5) as pool:
             for result in pool.imap_unordered(_worker, worker_args):
                 completed += 1
                 elapsed = time.time() - start_time
