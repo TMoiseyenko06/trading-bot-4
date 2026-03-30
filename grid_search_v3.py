@@ -13,9 +13,21 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
-import logging
 import multiprocessing as mp
 import os
+import warnings
+
+# Suppress fork() deprecation warning on Python 3.12+
+os.environ["PYTHONWARNINGS"] = "ignore::DeprecationWarning"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Use "forkserver" start method — avoids the fork-in-multithreaded-process issue
+# while still being faster than "spawn" (only forks once to create the server)
+try:
+    mp.set_start_method("forkserver")
+except RuntimeError:
+    pass  # already set
+import logging
 import time
 from dataclasses import dataclass
 
