@@ -67,13 +67,20 @@ DATASET = "GLBX.MDP3"
 # ------------------------------------------------------------------ #
 
 class TelegramNotifier:
-    """Sends trade alerts to a Telegram chat via bot API."""
+    """Sends trade alerts to a Telegram chat via bot API.
+
+    Also polls for incoming commands like /acc, /pos, /trades.
+    """
 
     def __init__(self, bot_token: str, chat_id: str) -> None:
         self._bot_token = bot_token
         self._chat_id = chat_id
         self._enabled = bool(bot_token and chat_id)
         self._base_url = f"https://api.telegram.org/bot{bot_token}"
+        self._last_update_id = 0
+        self._engine: Optional["LivePaperEngine"] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
         if self._enabled:
             logger.info("Telegram notifications enabled (chat_id=%s)", chat_id)
@@ -110,6 +117,183 @@ class TelegramNotifier:
                 logger.warning("Telegram send failed: %s", resp.text)
         except Exception as e:
             logger.warning("Telegram send error: %s", e)
+
+    def set_engine(self, engine: "LivePaperEngine") -> None:
+        """Attach the engine so commands can query account state."""
+        self._engine = engine
+
+    def start_polling(self) -> None:
+        """Start background thread that polls for Telegram commands."""
+        if not self._enabled:
+            return
+        self._stop_event.clear()
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, daemon=True
+        )
+        self._poll_thread.start()
+        logger.info("Telegram command polling started")
+
+    def stop_polling(self) -> None:
+        """Stop the polling thread."""
+        self._stop_event.set()
+
+    def _poll_loop(self) -> None:
+        """Long-poll for incoming Telegram messages."""
+        while not self._stop_event.is_set():
+            try:
+                resp = requests.get(
+                    f"{self._base_url}/getUpdates",
+                    params={
+                        "offset": self._last_update_id + 1,
+                        "timeout": 10,
+                    },
+                    timeout=15,
+                )
+                if not resp.ok:
+                    time.sleep(5)
+                    continue
+
+                data = resp.json()
+                for update in data.get("result", []):
+                    self._last_update_id = update["update_id"]
+                    msg = update.get("message", {})
+                    text = msg.get("text", "").strip()
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                    # Only respond to our chat
+                    if chat_id != self._chat_id:
+                        continue
+
+                    self._handle_command(text)
+
+            except Exception as e:
+                logger.debug("Telegram poll error: %s", e)
+                time.sleep(5)
+
+    def _handle_command(self, text: str) -> None:
+        """Route incoming commands."""
+        cmd = text.lower().split()[0] if text else ""
+        if cmd == "/acc":
+            self._cmd_account()
+        elif cmd == "/pos":
+            self._cmd_positions()
+        elif cmd == "/trades":
+            self._cmd_trades()
+        elif cmd == "/help":
+            self._cmd_help()
+        elif cmd.startswith("/"):
+            self.send(
+                "Unknown command. Send /help for available commands."
+            )
+
+    def _cmd_help(self) -> None:
+        msg = (
+            "<b>Available Commands:</b>\n"
+            "/acc — Account summary (equity, PnL, win rate)\n"
+            "/pos — Current open positions\n"
+            "/trades — Last 5 completed trades\n"
+            "/help — Show this message"
+        )
+        self.send(msg)
+
+    def _cmd_account(self) -> None:
+        if self._engine is None:
+            self.send("Engine not ready yet.")
+            return
+
+        eng = self._engine
+        eng._sync_equity()
+
+        total_realized = sum(
+            ctx.account.realized_pnl for ctx in eng._instruments.values()
+        )
+        total_unrealized = sum(
+            ctx.account.unrealized_pnl for ctx in eng._instruments.values()
+        )
+        total_commissions = sum(
+            ctx.account.total_commissions for ctx in eng._instruments.values()
+        )
+        all_trades = []
+        for ctx in eng._instruments.values():
+            all_trades.extend(ctx.account.trades)
+        total_trades = len(all_trades)
+        winners = sum(1 for t in all_trades if t.net_pnl > 0)
+        win_rate = (winners / total_trades * 100) if total_trades else 0
+        net_pnl = total_realized - total_commissions
+
+        msg = (
+            f"\U0001f4ca <b>ACCOUNT SUMMARY</b>\n"
+            f"\n"
+            f"Equity:       <b>${eng._equity:,.2f}</b>\n"
+            f"Initial:      ${eng._initial_capital:,.0f}\n"
+            f"Realized PnL: ${total_realized:+,.2f}\n"
+            f"Unrealized:   ${total_unrealized:+,.2f}\n"
+            f"Commissions:  ${total_commissions:,.2f}\n"
+            f"\n"
+            f"Trades: {total_trades}\n"
+            f"Win Rate: {win_rate:.1f}%\n"
+            f"Bars: {eng._bar_index}"
+        )
+        self.send(msg)
+
+    def _cmd_positions(self) -> None:
+        if self._engine is None:
+            self.send("Engine not ready yet.")
+            return
+
+        eng = self._engine
+        eng._sync_equity()
+        lines = ["\U0001f4cb <b>POSITIONS</b>\n"]
+        any_open = False
+
+        for symbol, ctx in sorted(eng._instruments.items()):
+            pos = ctx.account.position
+            if pos.is_flat:
+                lines.append(f"  {symbol}: FLAT")
+            else:
+                any_open = True
+                direction = "LONG" if pos.direction == 1 else "SHORT"
+                pnl = ctx.account.unrealized_pnl
+                last_price = ctx.last_bar.close if ctx.last_bar else 0
+                lines.append(
+                    f"  {symbol}: <b>{direction} {pos.quantity}</b> "
+                    f"@ {pos.avg_entry_price:,.2f}\n"
+                    f"    Last: {last_price:,.2f}  uPnL: ${pnl:+,.2f}"
+                )
+
+        if not any_open:
+            lines.append("\nAll positions flat.")
+
+        self.send("\n".join(lines))
+
+    def _cmd_trades(self) -> None:
+        if self._engine is None:
+            self.send("Engine not ready yet.")
+            return
+
+        eng = self._engine
+        all_trades: list[tuple[str, Trade]] = []
+        for sym, ctx in eng._instruments.items():
+            for t in ctx.account.trades:
+                all_trades.append((sym, t))
+
+        all_trades.sort(key=lambda x: x[1].exit_time, reverse=True)
+        recent = all_trades[:5]
+
+        if not recent:
+            self.send("No completed trades yet.")
+            return
+
+        lines = ["\U0001f4dd <b>LAST 5 TRADES</b>\n"]
+        for sym, t in recent:
+            emoji = "\u2705" if t.net_pnl >= 0 else "\u274c"
+            lines.append(
+                f"{emoji} <b>{sym}</b> {t.side.upper()}\n"
+                f"  {t.entry_price:,.2f} -> {t.exit_price:,.2f}\n"
+                f"  Net: ${t.net_pnl:+,.2f}  |  {t.hold_duration_bars} bars"
+            )
+
+        self.send("\n".join(lines))
 
     def send_fill(self, symbol: str, fill: Fill, equity: float) -> None:
         """Notify on order fill."""
@@ -578,6 +762,10 @@ def run_live(
         telegram=tg,
     )
 
+    # Let telegram commands query the engine, start listening
+    tg.set_engine(engine)
+    tg.start_polling()
+
     # Build Databento symbol subscriptions — use continuous front month
     stype = "continuous"
     db_symbols = [f"{sym}.FUT" for sym in instruments]
@@ -711,6 +899,7 @@ def run_live(
         logger.error("Live feed error: %s", e, exc_info=True)
         print(f"\nERROR: {e}")
     finally:
+        tg.stop_polling()
         print("\n\nFinal status:")
         engine.print_status()
         strategy.on_end()
