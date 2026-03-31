@@ -27,10 +27,10 @@ def main() -> None:
     parser.add_argument("dbn_file", help="Single .dbn file with all instruments")
     parser.add_argument("--instruments", nargs="+", required=True)
 
-    # Base params (V2 optimal defaults)
-    parser.add_argument("--lookback", type=int, default=60)
+    # Base params
+    parser.add_argument("--lookback", type=int, default=30)
     parser.add_argument("--z-entry", type=float, default=2.0)
-    parser.add_argument("--z-exit", type=float, default=0.5)
+    parser.add_argument("--z-exit", type=float, default=0.3)
     parser.add_argument("--confirm-bars", type=int, default=2)
     parser.add_argument("--stop-multiple", type=float, default=4.0)
     parser.add_argument("--momentum-threshold", type=float, default=0.75)
@@ -39,10 +39,10 @@ def main() -> None:
 
     # V3 params
     parser.add_argument("--z-spread", type=float, default=2.0)
-    parser.add_argument("--volume-spike", type=float, default=1.3)
+    parser.add_argument("--volume-spike", type=float, default=1.0)
     parser.add_argument("--per-leg-exit", action="store_true", default=True)
     parser.add_argument("--no-per-leg-exit", dest="per_leg_exit", action="store_false")
-    parser.add_argument("--time-weight", action="store_true", default=False)
+    parser.add_argument("--time-weight", action="store_true", default=True)
     parser.add_argument("--no-time-weight", dest="time_weight", action="store_false")
 
     # V3.1 win rate params
@@ -51,10 +51,10 @@ def main() -> None:
     parser.add_argument("--no-z-widening", dest="z_widening", action="store_false")
     parser.add_argument("--leg-stop-atr", type=float, default=3.0,
                         help="Per-leg ATR stop multiple (default: 3.0)")
-    parser.add_argument("--asymmetric-exit", action="store_true", default=False,
+    parser.add_argument("--asymmetric-exit", action="store_true", default=True,
                         help="Winners ride to full reversion, losers cut fast")
     parser.add_argument("--no-asymmetric-exit", dest="asymmetric_exit", action="store_false")
-    parser.add_argument("--vol-regime", action="store_true", default=False,
+    parser.add_argument("--vol-regime", action="store_true", default=True,
                         help="Skip entries when intraday vol is elevated")
     parser.add_argument("--no-vol-regime", dest="vol_regime", action="store_false")
     parser.add_argument("--vol-regime-mult", type=float, default=1.5,
