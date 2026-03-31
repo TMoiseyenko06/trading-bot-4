@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Live paper trading with Databento real-time data.
+"""Live paper trading with Databento real-time data + Telegram alerts.
 
 Streams 1-minute OHLCV bars from Databento's live API for NQ, ES, RTY, YM
 and feeds them into the V3 contrarian mean-reversion strategy with a
 simulated $100,000 paper trading account.
 
 Usage:
-  export DATABENTO_API_KEY=your_key_here
-  python run_live_paper.py --instruments NQ ES RTY YM --signal-only YM
+  1. Fill in .env with your API keys
+  2. python run_live_paper.py --instruments NQ ES RTY YM --signal-only YM
 
 Requires:
-  pip install databento
+  pip install databento python-dotenv requests
 """
 
 from __future__ import annotations
@@ -23,11 +23,13 @@ import signal
 import sys
 import threading
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import requests
+from dotenv import load_dotenv
 
 import databento as db
 
@@ -50,12 +52,130 @@ from strategies.contrarian_reversion_v3 import ContraMeanReversionV3
 
 logger = logging.getLogger(__name__)
 
+# Load .env from project root
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 # Databento fixed-precision price scale
 _DBN_PRICE_SCALE = 1e-9
 
 # CME Globex dataset
 DATASET = "GLBX.MDP3"
 
+
+# ------------------------------------------------------------------ #
+# Telegram notifier
+# ------------------------------------------------------------------ #
+
+class TelegramNotifier:
+    """Sends trade alerts to a Telegram chat via bot API."""
+
+    def __init__(self, bot_token: str, chat_id: str) -> None:
+        self._bot_token = bot_token
+        self._chat_id = chat_id
+        self._enabled = bool(bot_token and chat_id)
+        self._base_url = f"https://api.telegram.org/bot{bot_token}"
+
+        if self._enabled:
+            logger.info("Telegram notifications enabled (chat_id=%s)", chat_id)
+        else:
+            logger.warning(
+                "Telegram notifications disabled — "
+                "set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env"
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def send(self, message: str) -> None:
+        """Send a message (non-blocking, fire-and-forget)."""
+        if not self._enabled:
+            return
+        t = threading.Thread(target=self._send_sync, args=(message,), daemon=True)
+        t.start()
+
+    def _send_sync(self, message: str) -> None:
+        try:
+            resp = requests.post(
+                f"{self._base_url}/sendMessage",
+                json={
+                    "chat_id": self._chat_id,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            )
+            if not resp.ok:
+                logger.warning("Telegram send failed: %s", resp.text)
+        except Exception as e:
+            logger.warning("Telegram send error: %s", e)
+
+    def send_fill(self, symbol: str, fill: Fill, equity: float) -> None:
+        """Notify on order fill."""
+        side_emoji = "\U0001f7e2" if fill.side == OrderSide.BUY else "\U0001f534"
+        msg = (
+            f"{side_emoji} <b>FILL: {symbol}</b>\n"
+            f"  {fill.side.value.upper()} {fill.quantity} @ {fill.fill_price:,.2f}\n"
+            f"  Commission: ${fill.commission:.2f}\n"
+            f"  Equity: ${equity:,.2f}"
+        )
+        self.send(msg)
+
+    def send_trade_closed(
+        self, symbol: str, trade: Trade, equity: float,
+        total_trades: int, win_rate: float,
+    ) -> None:
+        """Notify on completed round-trip trade with stats."""
+        pnl_emoji = "\u2705" if trade.net_pnl >= 0 else "\u274c"
+        side_label = trade.side.upper()
+
+        msg = (
+            f"{pnl_emoji} <b>TRADE CLOSED: {symbol}</b>\n"
+            f"  Side: {side_label}\n"
+            f"  Entry: {trade.entry_price:,.2f}\n"
+            f"  Exit:  {trade.exit_price:,.2f}\n"
+            f"  Qty:   {trade.quantity}\n"
+            f"  Gross: ${trade.gross_pnl:+,.2f}\n"
+            f"  Net:   ${trade.net_pnl:+,.2f}\n"
+            f"  Commissions: ${trade.commissions:.2f}\n"
+            f"  Hold:  {trade.hold_duration_bars} bars\n"
+            f"\n"
+            f"<b>Account:</b>\n"
+            f"  Equity: ${equity:,.2f}\n"
+            f"  Trades: {total_trades}\n"
+            f"  Win Rate: {win_rate:.1f}%"
+        )
+        self.send(msg)
+
+    def send_startup(
+        self, instruments: list[str], signal_only: list[str], capital: float,
+    ) -> None:
+        """Notify that live paper trading has started."""
+        msg = (
+            f"\U0001f680 <b>LIVE PAPER TRADING STARTED</b>\n"
+            f"  Instruments: {', '.join(instruments)}\n"
+            f"  Signal-only: {', '.join(signal_only) if signal_only else 'None'}\n"
+            f"  Capital: ${capital:,.0f}\n"
+            f"  Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        self.send(msg)
+
+    def send_shutdown(self, equity: float, total_pnl: float, total_trades: int) -> None:
+        """Notify that live paper trading has stopped."""
+        msg = (
+            f"\U0001f6d1 <b>LIVE PAPER TRADING STOPPED</b>\n"
+            f"  Final Equity: ${equity:,.2f}\n"
+            f"  Total PnL: ${total_pnl:+,.2f}\n"
+            f"  Total Trades: {total_trades}\n"
+            f"  Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        self.send(msg)
+
+
+# ------------------------------------------------------------------ #
+# Live instrument context
+# ------------------------------------------------------------------ #
 
 @dataclass
 class _LiveInstrumentContext:
@@ -70,6 +190,10 @@ class _LiveInstrumentContext:
     new_orders: list[Order] = field(default_factory=list)
     last_bar: Optional[Bar] = None
 
+
+# ------------------------------------------------------------------ #
+# Live paper engine
+# ------------------------------------------------------------------ #
 
 class LivePaperEngine:
     """Live paper trading engine that mirrors MultiInstrumentEngine.
@@ -86,6 +210,7 @@ class LivePaperEngine:
         max_position_size: int = 20,
         registry: ContractRegistry | None = None,
         log_dir: str = "live_paper_logs",
+        telegram: TelegramNotifier | None = None,
     ) -> None:
         self._strategy = strategy
         self._instrument_symbols = sorted(instruments)
@@ -94,6 +219,7 @@ class LivePaperEngine:
         self._equity = initial_capital
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._telegram = telegram or TelegramNotifier("", "")
 
         # Per-instrument contexts
         self._instruments: dict[str, _LiveInstrumentContext] = {}
@@ -148,8 +274,27 @@ class LivePaperEngine:
                 trades = ctx.account.process_fill(fill, bar_index)
                 self._strategy.on_fill(symbol, fill)
                 self._log_fill(symbol, fill)
+
+                # Telegram: fill alert
+                self._sync_equity()
+                self._telegram.send_fill(symbol, fill, self._equity)
+
                 for trade in trades:
                     self._log_trade(symbol, trade)
+
+                    # Telegram: trade closed alert with stats
+                    self._sync_equity()
+                    total_trades = sum(
+                        len(c.account.trades) for c in self._instruments.values()
+                    )
+                    all_trades = []
+                    for c in self._instruments.values():
+                        all_trades.extend(c.account.trades)
+                    winners = sum(1 for t in all_trades if t.net_pnl > 0)
+                    win_rate = (winners / len(all_trades) * 100) if all_trades else 0
+                    self._telegram.send_trade_closed(
+                        symbol, trade, self._equity, total_trades, win_rate,
+                    )
 
             # Remove filled/cancelled
             ctx.pending_orders = [
@@ -343,6 +488,7 @@ class LivePaperEngine:
             "gross_pnl": trade.gross_pnl,
             "net_pnl": trade.net_pnl,
             "commissions": trade.commissions,
+            "hold_duration_bars": trade.hold_duration_bars,
         }
         self._trade_log.append(entry)
         self._append_log(entry)
@@ -413,18 +559,23 @@ def _extract_root_symbol(raw_symbol: str) -> str | None:
 def run_live(
     api_key: str,
     instruments: list[str],
+    signal_only: list[str],
     strategy: ContraMeanReversionV3,
     capital: float = 100_000.0,
     max_contracts: int = 20,
     status_interval: int = 60,
+    telegram: TelegramNotifier | None = None,
 ) -> None:
     """Connect to Databento live API and run paper trading."""
+
+    tg = telegram or TelegramNotifier("", "")
 
     engine = LivePaperEngine(
         strategy=strategy,
         instruments=instruments,
         initial_capital=capital,
         max_position_size=max_contracts,
+        telegram=tg,
     )
 
     # Build Databento symbol subscriptions — use continuous front month
@@ -436,13 +587,19 @@ def run_live(
     print("=" * 65)
     print(f"  Dataset:     {DATASET}")
     print(f"  Instruments: {instruments}")
+    if signal_only:
+        print(f"  Signal-only: {signal_only}")
     print(f"  DB Symbols:  {db_symbols}")
     print(f"  Schema:      ohlcv-1m")
     print(f"  Capital:     ${capital:,.0f}")
     print(f"  Max Size:    {max_contracts} contracts/instrument")
+    print(f"  Telegram:    {'ON' if tg.enabled else 'OFF'}")
     print(f"  Status every {status_interval}s")
     print("=" * 65)
     print()
+
+    # Telegram startup alert
+    tg.send_startup(instruments, signal_only, capital)
 
     # Track last status print time
     last_status_time = time.time()
@@ -478,7 +635,6 @@ def run_live(
 
             # Skip non-OHLCV records (e.g., symbol mapping, system events)
             if not hasattr(record, "open"):
-                # Handle symbol mapping messages
                 if hasattr(record, "stype_in_symbol"):
                     logger.info(
                         "Symbol mapping: %s -> instrument_id=%s",
@@ -494,10 +650,9 @@ def run_live(
             else:
                 ts_dt = ts
 
-            # Extract symbol — use the hd (header) for instrument_id
+            # Extract symbol
             raw_symbol = getattr(record, "symbol", None)
             if raw_symbol is None:
-                # Try to get symbol from the pretty_* fields or use instrument_id
                 raw_symbol = str(getattr(record, "instrument_id", "UNKNOWN"))
 
             # Map to root symbol
@@ -505,14 +660,12 @@ def run_live(
             if root is None or root not in instruments:
                 continue
 
-            # Build Bar from OHLCV record
-            # Databento prices are in fixed-precision (1e-9 scale)
+            # Build Bar from OHLCV record (Databento fixed-precision 1e-9)
             o = record.open * _DBN_PRICE_SCALE
             h = record.high * _DBN_PRICE_SCALE
             l = record.low * _DBN_PRICE_SCALE
             c = record.close * _DBN_PRICE_SCALE
 
-            # Sanity check — skip invalid bars
             if o <= 0 or h <= 0 or l <= 0 or c <= 0:
                 continue
 
@@ -530,12 +683,11 @@ def run_live(
             )
 
             # Buffer bars and process when we have all instruments at same timestamp
-            # Use minute-level grouping
             bar_minute = ts_dt.replace(second=0, microsecond=0)
 
             if last_ts is not None and bar_minute != last_ts and len(bar_buffer) > 0:
                 # New minute started — process buffered bars
-                if len(bar_buffer) >= 2:  # Need at least 2 instruments
+                if len(bar_buffer) >= 2:
                     engine.process_bar_group(dict(bar_buffer))
 
                     # Periodic status
@@ -562,6 +714,16 @@ def run_live(
         print("\n\nFinal status:")
         engine.print_status()
         strategy.on_end()
+
+        # Telegram shutdown alert
+        engine._sync_equity()
+        total_realized = sum(
+            ctx.account.realized_pnl for ctx in engine._instruments.values()
+        )
+        total_trades = sum(
+            len(ctx.account.trades) for ctx in engine._instruments.values()
+        )
+        tg.send_shutdown(engine._equity, total_realized, total_trades)
 
         # Save final state
         state_file = engine._log_dir / "final_state.json"
@@ -640,8 +802,6 @@ def main() -> None:
     parser.add_argument("--max-contracts", type=int, default=20)
 
     # Live feed
-    parser.add_argument("--api-key", type=str, default=None,
-                        help="Databento API key (or set DATABENTO_API_KEY env var)")
     parser.add_argument("--status-interval", type=int, default=60,
                         help="Print status every N seconds (default: 60)")
 
@@ -655,12 +815,19 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    # API key
-    api_key = args.api_key or os.environ.get("DATABENTO_API_KEY")
+    # API keys from .env
+    api_key = os.environ.get("DATABENTO_API_KEY", "")
     if not api_key:
-        print("ERROR: Databento API key required.")
-        print("  Set DATABENTO_API_KEY environment variable or use --api-key")
+        print("ERROR: DATABENTO_API_KEY not set in .env")
         sys.exit(1)
+
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    telegram = TelegramNotifier(tg_token, tg_chat_id)
+
+    if not telegram.enabled:
+        print("WARNING: Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+        print()
 
     instruments = [s.upper() for s in args.instruments]
     signal_only = [s.upper() for s in args.signal_only]
@@ -689,10 +856,12 @@ def main() -> None:
     run_live(
         api_key=api_key,
         instruments=instruments,
+        signal_only=signal_only,
         strategy=strategy,
         capital=args.capital,
         max_contracts=args.max_contracts,
         status_interval=args.status_interval,
+        telegram=telegram,
     )
 
 
