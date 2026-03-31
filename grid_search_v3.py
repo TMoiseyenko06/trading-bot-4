@@ -91,6 +91,7 @@ def run_single(
     capital: float,
     max_contracts: int,
     registry: ContractRegistry,
+    signal_only_symbols: list[str] | None = None,
 ) -> V3SearchResult:
     """Run one backtest with a specific parameter set."""
     strategy = ContraMeanReversionV3(
@@ -111,6 +112,7 @@ def run_single(
         asymmetric_exit=params.asymmetric_exit,
         vol_regime_filter=params.vol_regime_filter,
         vol_regime_multiple=params.vol_regime_multiple,
+        signal_only_symbols=signal_only_symbols,
     )
 
     config = EngineConfig(
@@ -278,7 +280,7 @@ def append_result_csv(path: str, r: V3SearchResult) -> None:
 
 
 def _worker(args_tuple) -> V3SearchResult | str:
-    dbn_source, instruments, params_dict, capital, max_contracts = args_tuple
+    dbn_source, instruments, params_dict, capital, max_contracts, signal_only = args_tuple
     logging.disable(logging.CRITICAL)
 
     params = V3ParamSet(**params_dict)
@@ -290,6 +292,7 @@ def _worker(args_tuple) -> V3SearchResult | str:
             capital=capital,
             max_contracts=max_contracts,
             registry=ContractRegistry(),
+            signal_only_symbols=signal_only,
         )
     except Exception as e:
         return f"ERROR: {e}"
@@ -358,6 +361,10 @@ def main() -> None:
     parser.add_argument("--vol-regime-mult", type=str, default="1.5",
                         help="Vol regime multiple (default: 1.5)")
 
+    # === SIGNAL-ONLY ===
+    parser.add_argument("--signal-only", nargs="+", default=[],
+                        help="Instruments used for signal but not traded (e.g., YM)")
+
     # === ENGINE ===
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--max-contracts", type=int, default=20)
@@ -397,6 +404,7 @@ def main() -> None:
     vol_regime_mults = parse_float_list(args.vol_regime_mult)
 
     instruments = [s.upper() for s in args.instruments]
+    signal_only = [s.upper() for s in args.signal_only]
 
     # Build all combinations
     combos = list(itertools.product(
@@ -417,6 +425,8 @@ def main() -> None:
     print("=" * 70)
     print(f"  Data: {args.dbn_file}")
     print(f"  Instruments: {instruments}")
+    if signal_only:
+        print(f"  Signal-only:  {signal_only} (no trades placed)")
     print(f"  Capital: ${args.capital:,.0f}")
     print()
     print("  BASE PARAMS:")
@@ -496,7 +506,7 @@ def main() -> None:
         )
         worker_args.append((
             args.dbn_file, instruments, params_dict,
-            args.capital, args.max_contracts,
+            args.capital, args.max_contracts, signal_only,
         ))
 
     remaining_total = len(worker_args)
@@ -518,7 +528,7 @@ def main() -> None:
         # Sequential mode
         registry = ContractRegistry()
         for i, wa in enumerate(worker_args, 1):
-            _, _, params_dict, cap, maxc = wa
+            _, _, params_dict, cap, maxc, sig_only = wa
             params = V3ParamSet(**params_dict)
             p = params
             elapsed = time.time() - start_time
@@ -537,6 +547,7 @@ def main() -> None:
                     dbn_source=args.dbn_file, instruments=instruments,
                     params=params, capital=cap,
                     max_contracts=maxc, registry=registry,
+                    signal_only_symbols=sig_only,
                 )
                 append_result_csv(csv_path, sr)
                 completed_count += 1

@@ -142,6 +142,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         asymmetric_exit: bool = False,
         vol_regime_filter: bool = False,
         vol_regime_multiple: float = 1.5,
+        signal_only_symbols: list[str] | None = None,  # instruments used for signal but not traded
     ) -> None:
         super().__init__(name)
         self._window_minutes = signal_window_minutes
@@ -173,6 +174,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._asymmetric_exit = asymmetric_exit
         self._vol_regime_filter = vol_regime_filter
         self._vol_regime_multiple = vol_regime_multiple
+        self._signal_only: set[str] = set(s.upper() for s in (signal_only_symbols or []))
 
         # Runtime state
         self._symbols: list[str] = []
@@ -532,6 +534,9 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
 
         entered = 0
         for sym in self._symbols:
+            if sym in self._signal_only:
+                continue
+
             data = self._data[sym]
             w = data.normalized_weight
             if abs(w) < 1e-10:
@@ -606,7 +611,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         all_reverted = all(
             abs(self._data[s].z_score) < effective_z_exit
             for s in self._symbols
-            if state.instruments[s].position_quantity > 0
+            if s not in self._signal_only and state.instruments[s].position_quantity > 0
         )
         if all_reverted:
             self._exit_all(state, submit_order, reason="TARGET_REVERT")
@@ -614,6 +619,9 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
 
         # Stop loss checks
         for sym in self._symbols:
+            if sym in self._signal_only:
+                continue
+
             inst = state.instruments[sym]
             if inst.position_quantity == 0:
                 continue
@@ -641,6 +649,9 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
     ) -> None:
         """Per-leg exit with optional asymmetric handling."""
         for sym in self._symbols:
+            if sym in self._signal_only:
+                continue
+
             inst = state.instruments[sym]
             data = self._data[sym]
 
@@ -701,6 +712,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         any_open = any(
             state.instruments[s].position_quantity > 0
             for s in self._symbols
+            if s not in self._signal_only
         )
         if not any_open:
             self._in_trade = False
@@ -744,6 +756,9 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             return
 
         for sym in self._symbols:
+            if sym in self._signal_only:
+                continue
+
             inst = state.instruments[sym]
             if inst.position_quantity == 0:
                 continue

@@ -60,6 +60,10 @@ def main() -> None:
     parser.add_argument("--vol-regime-mult", type=float, default=1.5,
                         help="Vol regime threshold multiple (default: 1.5)")
 
+    # Signal-only instruments (used for signal computation but not traded)
+    parser.add_argument("--signal-only", nargs="+", default=[],
+                        help="Instruments to use for signal but not trade (e.g., YM)")
+
     # Engine params
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--max-contracts", type=int, default=20)
@@ -93,9 +97,13 @@ def main() -> None:
     print(f"    z_spread={args.z_spread}, volume_spike={args.volume_spike}")
     print(f"    per_leg={args.per_leg_exit}, time_weight={args.time_weight}")
     print()
+    signal_only = [s.upper() for s in args.signal_only]
+
     print("  V3.1 win rate params:")
     print(f"    z_widening={args.z_widening}, leg_stop_atr={args.leg_stop_atr}")
     print(f"    asymmetric={args.asymmetric_exit}, vol_regime={args.vol_regime}/{args.vol_regime_mult}")
+    if signal_only:
+        print(f"    signal_only={signal_only}")
     print("=" * 60)
     print()
 
@@ -117,6 +125,7 @@ def main() -> None:
         asymmetric_exit=args.asymmetric_exit,
         vol_regime_filter=args.vol_regime,
         vol_regime_multiple=args.vol_regime_mult,
+        signal_only_symbols=signal_only,
     )
 
     config = EngineConfig(
