@@ -108,7 +108,7 @@ class LivePaperEngine:
             executor = ExecutionSimulator(
                 contract_spec=spec,
                 slippage_config=SlippageConfig(
-                    model=SlippageModel.FIXED, fixed_ticks=1.0
+                    model=SlippageModel.FIXED, fixed_ticks=0.0
                 ),
             )
             session = SessionHandler(spec)
