@@ -167,6 +167,7 @@ def main() -> None:
         equity_curve=raw["equity_curve"],
         total_margin_calls=raw["total_margin_calls"],
         total_forced_liquidations=raw["total_forced_liquidations"],
+        daily_profit_cap=args.daily_profit_cap,
     )
 
     reporter = ReportGenerator(config.results_dir)

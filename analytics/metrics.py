@@ -27,6 +27,7 @@ class MetricsCalculator:
         equity_curve: list[tuple[datetime, float, Optional[float]]],
         total_margin_calls: int,
         total_forced_liquidations: int,
+        daily_profit_cap: float = 0.0,
     ) -> BacktestResult:
         """Compute all metrics and return a BacktestResult."""
 
@@ -68,11 +69,33 @@ class MetricsCalculator:
 
         # Daily PnL series
         daily_pnls = MetricsCalculator._compute_daily_pnls(equity_curve)
+
+        # Apply daily profit cap — clamp each day's profit to the cap
+        if daily_profit_cap > 0 and daily_pnls:
+            daily_pnls = [
+                min(p, daily_profit_cap) if p > 0 else p
+                for p in daily_pnls
+            ]
+            # Recalculate capped net PnL and final equity
+            net_pnl = sum(daily_pnls)
+            final_equity = initial_capital + net_pnl
+
         avg_daily = (
             sum(daily_pnls) / len(daily_pnls) if daily_pnls else 0.0
         )
         worst_daily = min(daily_pnls) if daily_pnls else 0.0
         best_daily = max(daily_pnls) if daily_pnls else 0.0
+
+        # Rebuild capped equity curve for drawdown/sharpe calculations
+        if daily_profit_cap > 0 and daily_pnls:
+            capped_equity_curve = []
+            eq = initial_capital
+            for pnl in daily_pnls:
+                eq += pnl
+                capped_equity_curve.append((None, eq, eq))
+            dd_dollars, dd_pct, dd_bars, dd_wall = MetricsCalculator._compute_drawdown(
+                capped_equity_curve
+            )
 
         # Sharpe, Sortino, Calmar
         sharpe = MetricsCalculator._annualized_sharpe(daily_pnls)
