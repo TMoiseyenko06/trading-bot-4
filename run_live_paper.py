@@ -1039,24 +1039,48 @@ def run_live(
             else:
                 ts_dt = ts
 
-            # Extract symbol
-            raw_symbol = getattr(record, "symbol", None)
+            # Extract symbol — try multiple attributes
+            raw_symbol = None
+            for attr in ("pretty_symbol", "symbol", "stype_in_symbol"):
+                val = getattr(record, attr, None)
+                if val and isinstance(val, str) and val != "":
+                    raw_symbol = val
+                    break
+
+            # Fall back to instrument_id -> symbology lookup
             if raw_symbol is None:
-                raw_symbol = str(getattr(record, "instrument_id", "UNKNOWN"))
+                iid = getattr(record, "instrument_id", None)
+                if iid is not None and hasattr(live_client, "symbology_map"):
+                    raw_symbol = live_client.symbology_map.get(iid)
+                if raw_symbol is None:
+                    raw_symbol = str(iid) if iid is not None else "UNKNOWN"
 
             # Map to root symbol
             root = _extract_root_symbol(raw_symbol)
             if root is None or root not in instruments:
+                logger.debug("Skipping record: raw_symbol=%s, root=%s", raw_symbol, root)
                 continue
 
-            # Build Bar from OHLCV record (Databento fixed-precision 1e-9)
-            o = record.open * _DBN_PRICE_SCALE
-            h = record.high * _DBN_PRICE_SCALE
-            l = record.low * _DBN_PRICE_SCALE
-            c = record.close * _DBN_PRICE_SCALE
+            # Build Bar from OHLCV record
+            # Databento prices: if int, they're fixed-precision (1e-9 scale)
+            # If already float, use as-is
+            raw_o = record.open
+            if isinstance(raw_o, int) and raw_o > 1_000_000:
+                o = raw_o * _DBN_PRICE_SCALE
+                h = record.high * _DBN_PRICE_SCALE
+                l = record.low * _DBN_PRICE_SCALE
+                c = record.close * _DBN_PRICE_SCALE
+            else:
+                o = float(raw_o)
+                h = float(record.high)
+                l = float(record.low)
+                c = float(record.close)
 
             if o <= 0 or h <= 0 or l <= 0 or c <= 0:
                 continue
+
+            logger.debug("BAR: %s root=%s O=%.2f H=%.2f L=%.2f C=%.2f V=%s",
+                         raw_symbol, root, o, h, l, c, record.volume)
 
             vol = int(record.volume)
 
