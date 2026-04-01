@@ -682,6 +682,201 @@ class LivePaperEngine:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
+    # ------------------------------------------------------------------ #
+    # State persistence — save/restore for resume across restarts
+    # ------------------------------------------------------------------ #
+
+    def save_state(self) -> None:
+        """Save full engine state to disk for resume."""
+        self._sync_equity()
+        state = {
+            "version": 2,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "initial_capital": self._initial_capital,
+            "equity": self._equity,
+            "bar_index": self._bar_index,
+            "instruments": {},
+        }
+
+        for sym, ctx in self._instruments.items():
+            pos = ctx.account.position
+            acct = ctx.account
+
+            # Serialize completed trades
+            trades_data = []
+            for t in acct.trades:
+                trades_data.append({
+                    "entry_time": t.entry_time.isoformat(),
+                    "exit_time": t.exit_time.isoformat(),
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "quantity": t.quantity,
+                    "side": t.side,
+                    "gross_pnl": t.gross_pnl,
+                    "net_pnl": t.net_pnl,
+                    "commissions": t.commissions,
+                    "slippage_ticks": t.slippage_ticks,
+                    "slippage_dollars": t.slippage_dollars,
+                    "hold_duration_bars": t.hold_duration_bars,
+                    "entry_bar_index": t.entry_bar_index,
+                    "exit_bar_index": t.exit_bar_index,
+                    "notional_value": t.notional_value,
+                })
+
+            # Serialize equity curve
+            eq_curve = []
+            for ts, eq, settle in acct.equity_curve:
+                eq_curve.append({
+                    "ts": ts.isoformat() if ts else None,
+                    "equity": eq,
+                    "settlement": settle,
+                })
+
+            # Pending entry (open position cost tracking)
+            pending_entry = None
+            if acct._pending_entry is not None:
+                pe = acct._pending_entry
+                pending_entry = {
+                    "time": pe.time.isoformat(),
+                    "price": pe.price,
+                    "bar_index": pe.bar_index,
+                    "quantity": pe.quantity,
+                    "side": pe.side,
+                    "total_slippage_ticks": pe.total_slippage_ticks,
+                    "total_slippage_dollars": pe.total_slippage_dollars,
+                    "total_commissions": pe.total_commissions,
+                }
+
+            state["instruments"][sym] = {
+                "position": {
+                    "direction": pos.direction,
+                    "quantity": pos.quantity,
+                    "avg_entry_price": pos.avg_entry_price,
+                },
+                "realized_pnl": acct.realized_pnl,
+                "unrealized_pnl": acct.unrealized_pnl,
+                "total_commissions": acct.total_commissions,
+                "total_slippage_dollars": acct.total_slippage_dollars,
+                "margin_used": acct.margin_used,
+                "last_settlement_price": acct._last_settlement_price,
+                "daily_pnl": acct._daily_pnl,
+                "total_margin_calls": acct.total_margin_calls,
+                "total_forced_liquidations": acct.total_forced_liquidations,
+                "trades": trades_data,
+                "equity_curve": eq_curve,
+                "pending_entry": pending_entry,
+            }
+
+        state_file = self._log_dir / "engine_state.json"
+        tmp_file = self._log_dir / "engine_state.json.tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(state, f, indent=2)
+        tmp_file.rename(state_file)
+        logger.info("State saved to %s", state_file)
+
+    def restore_state(self) -> bool:
+        """Restore engine state from disk. Returns True if restored."""
+        state_file = self._log_dir / "engine_state.json"
+        if not state_file.exists():
+            return False
+
+        try:
+            with open(state_file) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error("Failed to load state: %s", e)
+            return False
+
+        if state.get("version", 1) < 2:
+            logger.warning("Old state format, cannot resume")
+            return False
+
+        self._bar_index = state["bar_index"]
+        self._initial_capital = state["initial_capital"]
+
+        for sym, inst_state in state["instruments"].items():
+            if sym not in self._instruments:
+                continue
+
+            ctx = self._instruments[sym]
+            acct = ctx.account
+
+            # Restore position
+            pos_data = inst_state["position"]
+            acct.position.direction = pos_data["direction"]
+            acct.position.quantity = pos_data["quantity"]
+            acct.position.avg_entry_price = pos_data["avg_entry_price"]
+
+            # Restore account state
+            acct.realized_pnl = inst_state["realized_pnl"]
+            acct.unrealized_pnl = inst_state["unrealized_pnl"]
+            acct.total_commissions = inst_state["total_commissions"]
+            acct.total_slippage_dollars = inst_state["total_slippage_dollars"]
+            acct.margin_used = inst_state["margin_used"]
+            acct._last_settlement_price = inst_state["last_settlement_price"]
+            acct._daily_pnl = inst_state["daily_pnl"]
+            acct.total_margin_calls = inst_state["total_margin_calls"]
+            acct.total_forced_liquidations = inst_state["total_forced_liquidations"]
+
+            # Restore trades
+            acct.trades = []
+            for td in inst_state["trades"]:
+                acct.trades.append(Trade(
+                    entry_time=datetime.fromisoformat(td["entry_time"]),
+                    exit_time=datetime.fromisoformat(td["exit_time"]),
+                    entry_price=td["entry_price"],
+                    exit_price=td["exit_price"],
+                    quantity=td["quantity"],
+                    side=td["side"],
+                    gross_pnl=td["gross_pnl"],
+                    net_pnl=td["net_pnl"],
+                    commissions=td["commissions"],
+                    slippage_ticks=td["slippage_ticks"],
+                    slippage_dollars=td["slippage_dollars"],
+                    hold_duration_bars=td["hold_duration_bars"],
+                    entry_bar_index=td["entry_bar_index"],
+                    exit_bar_index=td["exit_bar_index"],
+                    notional_value=td["notional_value"],
+                ))
+
+            # Restore equity curve
+            acct.equity_curve = []
+            for ec in inst_state["equity_curve"]:
+                ts = datetime.fromisoformat(ec["ts"]) if ec["ts"] else None
+                acct.equity_curve.append((ts, ec["equity"], ec["settlement"]))
+
+            # Restore pending entry
+            pe_data = inst_state.get("pending_entry")
+            if pe_data:
+                from engine.account import _PendingEntry
+                acct._pending_entry = _PendingEntry(
+                    time=datetime.fromisoformat(pe_data["time"]),
+                    price=pe_data["price"],
+                    bar_index=pe_data["bar_index"],
+                    quantity=pe_data["quantity"],
+                    side=pe_data["side"],
+                    total_slippage_ticks=pe_data["total_slippage_ticks"],
+                    total_slippage_dollars=pe_data["total_slippage_dollars"],
+                    total_commissions=pe_data["total_commissions"],
+                )
+            else:
+                acct._pending_entry = None
+
+        self._sync_equity()
+
+        saved_time = state.get("timestamp", "unknown")
+        total_trades = sum(
+            len(ctx.account.trades) for ctx in self._instruments.values()
+        )
+        logger.info(
+            "State restored from %s — equity=$%.2f, bars=%d, trades=%d",
+            saved_time, self._equity, self._bar_index, total_trades,
+        )
+        print(f"\n  RESUMED from saved state ({saved_time})")
+        print(f"  Equity: ${self._equity:,.2f}  |  Bars: {self._bar_index}  |  Trades: {total_trades}")
+        print()
+        return True
+
     def print_status(self) -> None:
         """Print current account status."""
         self._sync_equity()
@@ -749,6 +944,7 @@ def run_live(
     max_contracts: int = 20,
     status_interval: int = 60,
     telegram: TelegramNotifier | None = None,
+    resume: bool = False,
 ) -> None:
     """Connect to Databento live API and run paper trading."""
 
@@ -761,6 +957,11 @@ def run_live(
         max_position_size=max_contracts,
         telegram=tg,
     )
+
+    # Resume from saved state if requested
+    if resume:
+        if not engine.restore_state():
+            print("No saved state found — starting fresh")
 
     # Let telegram commands query the engine, start listening
     tg.set_engine(engine)
@@ -878,10 +1079,11 @@ def run_live(
                 if len(bar_buffer) >= 2:
                     engine.process_bar_group(dict(bar_buffer))
 
-                    # Periodic status
+                    # Periodic status + auto-save
                     now = time.time()
                     if now - last_status_time >= status_interval:
                         engine.print_status()
+                        engine.save_state()
                         last_status_time = now
 
                 bar_buffer.clear()
@@ -914,33 +1116,9 @@ def run_live(
         )
         tg.send_shutdown(engine._equity, total_realized, total_trades)
 
-        # Save final state
-        state_file = engine._log_dir / "final_state.json"
-        final = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "equity": engine._equity,
-            "initial_capital": engine._initial_capital,
-            "bars_processed": engine._bar_index,
-            "positions": {},
-            "per_instrument": {},
-        }
-        for sym, ctx in engine._instruments.items():
-            pos = ctx.account.position
-            final["positions"][sym] = {
-                "direction": pos.direction,
-                "quantity": pos.quantity,
-                "avg_entry": pos.avg_entry_price,
-            }
-            final["per_instrument"][sym] = {
-                "realized_pnl": ctx.account.realized_pnl,
-                "unrealized_pnl": ctx.account.unrealized_pnl,
-                "trades": len(ctx.account.trades),
-                "commissions": ctx.account.total_commissions,
-            }
-
-        with open(state_file, "w") as f:
-            json.dump(final, f, indent=2)
-        print(f"\nState saved to {state_file}")
+        # Save state for resume
+        engine.save_state()
+        print(f"\nState saved — restart with --resume to continue")
         print(f"Trade log at {engine._log_dir / 'live_trades.jsonl'}")
 
 
@@ -997,6 +1175,10 @@ def main() -> None:
     # Live feed
     parser.add_argument("--status-interval", type=int, default=60,
                         help="Print status every N seconds (default: 60)")
+
+    # Resume
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from saved state in live_paper_logs/")
 
     # Logging
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -1056,6 +1238,7 @@ def main() -> None:
         max_contracts=args.max_contracts,
         status_interval=args.status_interval,
         telegram=telegram,
+        resume=args.resume,
     )
 
 
