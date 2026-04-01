@@ -1095,33 +1095,39 @@ def run_live(
                 duration_ns=60_000_000_000,  # 1 minute
             )
 
-            # Buffer bars and process when we have all instruments at same timestamp
+            # Buffer bars by minute, process when all instruments received
             bar_minute = ts_dt.replace(second=0, microsecond=0)
 
+            # New minute started — flush previous buffer
             if last_ts is not None and bar_minute != last_ts and len(bar_buffer) > 0:
-                # New minute started — process buffered bars
                 if len(bar_buffer) >= 2:
                     engine.process_bar_group(dict(bar_buffer))
-
-                    # Print first 5 bars to confirm data is flowing
-                    if engine._bar_index <= 5:
-                        ts_str = last_ts.strftime("%H:%M") if last_ts else "?"
-                        parts = [f"{s} {bar_buffer[s].close:,.2f}" for s in sorted(bar_buffer)]
-                        print(f"  [{engine._bar_index}/5] {ts_str} | {' | '.join(parts)}")
-                        if engine._bar_index == 5:
-                            print("  Data confirmed OK — running silently now.\n")
-
-                    # Periodic status + auto-save
-                    now = time.time()
-                    if now - last_status_time >= status_interval:
-                        engine.print_status()
-                        engine.save_state()
-                        last_status_time = now
-
                 bar_buffer.clear()
 
             bar_buffer[root] = bar
             last_ts = bar_minute
+
+            # Process when we have all instruments for this minute
+            if len(bar_buffer) >= len(instruments):
+                engine.process_bar_group(dict(bar_buffer))
+
+                # Print first 5 bars to confirm data is flowing
+                if engine._bar_index <= 5:
+                    ts_str = bar_minute.strftime("%H:%M")
+                    parts = [f"{s} {bar_buffer[s].close:,.2f}" for s in sorted(bar_buffer)]
+                    print(f"  [{engine._bar_index}/5] {ts_str} | {' | '.join(parts)}")
+                    if engine._bar_index == 5:
+                        print("  Data confirmed OK — running silently now.\n")
+
+                # Periodic status + auto-save
+                now = time.time()
+                if now - last_status_time >= status_interval:
+                    engine.print_status()
+                    engine.save_state()
+                    last_status_time = now
+
+                bar_buffer.clear()
+                last_ts = None
 
         # Process any remaining bars
         if len(bar_buffer) >= 2:
