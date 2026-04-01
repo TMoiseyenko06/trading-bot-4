@@ -771,7 +771,7 @@ class LivePaperEngine:
         tmp_file = self._log_dir / "engine_state.json.tmp"
         with open(tmp_file, "w") as f:
             json.dump(state, f, indent=2)
-        tmp_file.rename(state_file)
+        tmp_file.replace(state_file)  # .replace() overwrites on Windows, .rename() doesn't
         logger.info("State saved to %s", state_file)
 
     def restore_state(self) -> bool:
