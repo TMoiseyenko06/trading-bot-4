@@ -969,7 +969,7 @@ def run_live(
 
     # Build Databento symbol subscriptions — use continuous front month
     stype = "continuous"
-    db_symbols = [f"{sym}.FUT" for sym in instruments]
+    db_symbols = [f"{sym}.c.0" for sym in instruments]
 
     print("=" * 65)
     print("  LIVE PAPER TRADING — Databento Real-Time Feed")
