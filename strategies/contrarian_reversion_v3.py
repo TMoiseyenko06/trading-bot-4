@@ -274,25 +274,28 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
                 self._exit_all(state, submit_order, reason="SESSION_CUTOFF")
             return
 
-        # If in trade, check exits continuously
-        if self._in_trade:
-            self._check_exits(state, submit_order)
-            return
-
-        # Daily profit cap — stop entering new trades once hit
+        # Daily profit cap — hard cap: close open trades and stop for the day
         if self._daily_profit_cap > 0 and not self._daily_cap_hit:
             daily_pnl = state.equity - self._session_start_equity
             if daily_pnl >= self._daily_profit_cap:
                 self._daily_cap_hit = True
                 logger.info(
-                    "[%s] DAILY PROFIT CAP HIT: $%.2f >= $%.2f — no new entries",
+                    "[%s] DAILY PROFIT CAP HIT: $%.2f >= $%.2f — closing all and done for the day",
                     self.name, daily_pnl, self._daily_profit_cap,
                 )
+                if self._in_trade:
+                    self._exit_all(state, submit_order, reason="DAILY_CAP")
+                return
 
-        # Not in trade — check for entry signal
         if self._daily_cap_hit:
             return
 
+        # If in trade, check exits continuously
+        if self._in_trade:
+            self._check_exits(state, submit_order)
+            return
+
+        # Not in trade — check for entry signal
         if self._session_bars >= self._lookback_bars:
             if self._check_entry_signal(state):
                 self._enter_basket(state, submit_order)
