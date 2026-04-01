@@ -143,6 +143,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         vol_regime_filter: bool = False,
         vol_regime_multiple: float = 1.5,
         signal_only_symbols: list[str] | None = None,  # instruments used for signal but not traded
+        daily_profit_cap: float = 0.0,  # stop trading for the day after this much profit (0=disabled)
     ) -> None:
         super().__init__(name)
         self._window_minutes = signal_window_minutes
@@ -175,6 +176,7 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._vol_regime_filter = vol_regime_filter
         self._vol_regime_multiple = vol_regime_multiple
         self._signal_only: set[str] = set(s.upper() for s in (signal_only_symbols or []))
+        self._daily_profit_cap = daily_profit_cap
 
         # Runtime state
         self._symbols: list[str] = []
@@ -186,6 +188,8 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._session_bars: int = 0
         self._skip_first_bars: int = 0
         self._active_legs: int = 0
+        self._session_start_equity: float = 0.0
+        self._daily_cap_hit: bool = False
 
         # Rolling market return history for momentum filter
         self._market_return_history: deque = deque(maxlen=200)
@@ -275,7 +279,20 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
             self._check_exits(state, submit_order)
             return
 
+        # Daily profit cap — stop entering new trades once hit
+        if self._daily_profit_cap > 0 and not self._daily_cap_hit:
+            daily_pnl = state.equity - self._session_start_equity
+            if daily_pnl >= self._daily_profit_cap:
+                self._daily_cap_hit = True
+                logger.info(
+                    "[%s] DAILY PROFIT CAP HIT: $%.2f >= $%.2f — no new entries",
+                    self.name, daily_pnl, self._daily_profit_cap,
+                )
+
         # Not in trade — check for entry signal
+        if self._daily_cap_hit:
+            return
+
         if self._session_bars >= self._lookback_bars:
             if self._check_entry_signal(state):
                 self._enter_basket(state, submit_order)
@@ -796,10 +813,12 @@ class ContraMeanReversionV3(MultiInstrumentStrategy):
         self._session_bars = 0
         self._skip_first_bars = 0
         self._active_legs = 0
+        self._session_start_equity = state.equity
+        self._daily_cap_hit = False
         self._market_return_history.clear()
         self._market_vol_history.clear()
 
-        logger.info("[%s] Session open — state reset", self.name)
+        logger.info("[%s] Session open — state reset, equity=%.2f", self.name, state.equity)
 
     # ------------------------------------------------------------------ #
     # Display

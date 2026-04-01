@@ -986,6 +986,10 @@ def main() -> None:
     parser.add_argument("--signal-only", nargs="+", default=["YM"],
                         help="Signal-only instruments (default: YM)")
 
+    # Daily profit cap
+    parser.add_argument("--daily-profit-cap", type=float, default=1000.0,
+                        help="Stop trading after this daily profit (default: 1000)")
+
     # Paper account
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--max-contracts", type=int, default=20)
@@ -1040,6 +1044,7 @@ def main() -> None:
         vol_regime_filter=args.vol_regime,
         vol_regime_multiple=args.vol_regime_mult,
         signal_only_symbols=signal_only,
+        daily_profit_cap=args.daily_profit_cap,
     )
 
     run_live(

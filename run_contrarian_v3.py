@@ -64,6 +64,10 @@ def main() -> None:
     parser.add_argument("--signal-only", nargs="+", default=[],
                         help="Instruments to use for signal but not trade (e.g., YM)")
 
+    # Daily profit cap
+    parser.add_argument("--daily-profit-cap", type=float, default=0.0,
+                        help="Stop trading for the day after this much profit (0=disabled)")
+
     # Engine params
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--max-contracts", type=int, default=20)
@@ -104,6 +108,8 @@ def main() -> None:
     print(f"    asymmetric={args.asymmetric_exit}, vol_regime={args.vol_regime}/{args.vol_regime_mult}")
     if signal_only:
         print(f"    signal_only={signal_only}")
+    if args.daily_profit_cap > 0:
+        print(f"    daily_profit_cap=${args.daily_profit_cap:,.0f}")
     print("=" * 60)
     print()
 
@@ -126,6 +132,7 @@ def main() -> None:
         vol_regime_filter=args.vol_regime,
         vol_regime_multiple=args.vol_regime_mult,
         signal_only_symbols=signal_only,
+        daily_profit_cap=args.daily_profit_cap,
     )
 
     config = EngineConfig(
