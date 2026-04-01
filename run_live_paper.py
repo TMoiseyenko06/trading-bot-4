@@ -1079,6 +1079,14 @@ def run_live(
                 if len(bar_buffer) >= 2:
                     engine.process_bar_group(dict(bar_buffer))
 
+                    # Print first 5 bars to confirm data is flowing
+                    if engine._bar_index <= 5:
+                        ts_str = last_ts.strftime("%H:%M") if last_ts else "?"
+                        parts = [f"{s} {bar_buffer[s].close:,.2f}" for s in sorted(bar_buffer)]
+                        print(f"  [{engine._bar_index}/5] {ts_str} | {' | '.join(parts)}")
+                        if engine._bar_index == 5:
+                            print("  Data confirmed OK — running silently now.\n")
+
                     # Periodic status + auto-save
                     now = time.time()
                     if now - last_status_time >= status_interval:
