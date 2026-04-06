@@ -6,4 +6,4 @@ services:
     env_file: .env
     volumes:
       - ./live_paper_logs:/app/live_paper_logs
-    command: ["--instruments", "NQ", "ES", "RTY", "YM", "--signal-only", "YM"]
+    command: ["--instruments", "NQ", "ES", "RTY", "YM", "--signal-only", "ES", "RTY", "YM"]
